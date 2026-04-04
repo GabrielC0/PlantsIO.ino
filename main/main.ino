@@ -1,24 +1,23 @@
 // ============================================================
-//   🌱 Arrosage Automatique — ESP32 + WiFiManager + Adafruit IO
-// ============================================================
-//
-//  Bibliothèques requises (Gestionnaire de bibliothèques) :
-//    - WiFiManager       (tzapu)
-//    - Adafruit MQTT Library
-//    - Adafruit SSD1306
-//    - Adafruit GFX Library
+//   Arrosage Automatique — ESP32 + WiFiManager + Adafruit IO
+//   + OTA via GitHub (HTTP/HTTPS)
 // ============================================================
 
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <Wire.h>
+#include <time.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "Adafruit_MQTT.h"
 #include "Adafruit_MQTT_Client.h"
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Update.h>
+#include <WebServer.h>
 
 // ─────────────────────────────────────────
-//   ⚠️  VOS IDENTIFIANTS ADAFRUIT IO
+//   Adafruit IO
 // ─────────────────────────────────────────
 #define IO_USERNAME    ""
 #define IO_KEY         ""
@@ -27,7 +26,7 @@
 #define AIO_SERVERPORT  1883
 
 // ─────────────────────────────────────────
-//   Pins
+//   Pins & Display
 // ─────────────────────────────────────────
 #define RELAY_PIN     26
 #define SCREEN_WIDTH  128
@@ -36,32 +35,69 @@
 #define OLED_ADDRESS  0x3C
 
 // ─────────────────────────────────────────
-//   Constantes
+//   WiFi
 // ─────────────────────────────────────────
-#define WIFI_MAX_RETRIES  3       
-#define WIFI_RETRY_DELAY  10000  
+#define WIFI_MAX_RETRIES  3
+#define WIFI_RETRY_DELAY  10000
 #define AP_SSID           "Arrosage-Setup"
+
+// ─────────────────────────────────────────
+//   OTA — À CONFIGURER
+// ─────────────────────────────────────────
+// Version locale du firmware (format X.Y.Z)
+#define FW_VERSION        "1.0.0"
+
+// URLs RAW GitHub (format : raw.githubusercontent.com/USER/REPO/BRANCHE/fichier)
+#define OTA_VERSION_URL   "https://raw.githubusercontent.com/GabrielC0/PlantsIO.ino/main/version.txt"
+#define OTA_FIRMWARE_URL  "https://raw.githubusercontent.com/GabrielC0/PlantsIO.ino/main/firmware.bin"
+
+// Timeout téléchargement (ms)
+#define OTA_TIMEOUT_MS    60000
 
 // ─────────────────────────────────────────
 //   Objets
 // ─────────────────────────────────────────
 Adafruit_SSD1306  display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 WiFiManager       wifiManager;
+WebServer         server(80);
 
-// Création du client MQTT
 WiFiClient client;
 Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, IO_USERNAME, IO_USERNAME, IO_KEY);
 
-// Feed de commande : reçoit ON/OFF depuis le dashboard
-Adafruit_MQTT_Subscribe pumpFeed = Adafruit_MQTT_Subscribe(&mqtt, IO_USERNAME "/feeds/pompe");
-Adafruit_MQTT_Publish pumpGet = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/pompe/get");
-Adafruit_MQTT_Publish stateFeed = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/pompe_etat");
+Adafruit_MQTT_Subscribe pumpFeed     = Adafruit_MQTT_Subscribe(&mqtt, IO_USERNAME "/feeds/pompe");
+Adafruit_MQTT_Publish   pumpGet      = Adafruit_MQTT_Publish(&mqtt,   IO_USERNAME "/feeds/pompe/get");
+Adafruit_MQTT_Publish   stateFeed    = Adafruit_MQTT_Publish(&mqtt,   IO_USERNAME "/feeds/pompe_etat");
+Adafruit_MQTT_Subscribe programmeFeed = Adafruit_MQTT_Subscribe(&mqtt, IO_USERNAME "/feeds/programme");
+Adafruit_MQTT_Publish   programmeGet  = Adafruit_MQTT_Publish(&mqtt,  IO_USERNAME "/feeds/programme/get");
 
 // ─────────────────────────────────────────
-//   État global
+//   État global — Arrosage
 // ─────────────────────────────────────────
 bool pumpRunning  = false;
 bool aioConnected = false;
+bool timeSynced   = false;
+unsigned long lastTimeSyncMs = 0;
+
+bool hasProgram      = false;
+char nextWaterDate[8] = "--/--";
+char nextWaterTime[6] = "--:--";
+char nextWaterDur[8]  = "";
+
+// ─────────────────────────────────────────
+//   État global — OTA
+// ─────────────────────────────────────────
+enum OtaState {
+  OTA_IDLE,
+  OTA_CHECKING,
+  OTA_DOWNLOADING,
+  OTA_SUCCESS,
+  OTA_NO_UPDATE,
+  OTA_ERROR
+};
+
+OtaState otaState     = OTA_IDLE;
+String   otaMessage   = "Inactif";
+bool     otaRequested = false;  // Flag déclenché par GET /update
 
 // ─────────────────────────────────────────
 //   Prototypes
@@ -72,47 +108,229 @@ void     startConfigPortal();
 void     connectAdafruitIO();
 void     setPump(bool state);
 void     updateStatusScreen();
+bool     syncTimeNow();
+String   getCurrentTimeString();
+void     showPumpStatusChange(bool state);
+void     showWifiConnecting(int attempt);
+void     showWifiConfigPortal();
+
+void     setupWebServer();
+void     setOtaState(OtaState state, String detail = "");
+void     checkAndUpdate();
+String   getRemoteVersion();
+bool     isNewerVersion(const String& remoteVer, const String& localVer);
+void     performOTA();
+
+
+// ════════════════════════════════════════════════════════════
+//                   PAGE WEB EMBARQUÉE
+// ════════════════════════════════════════════════════════════
+
+static const char HTML_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32 – Mise a jour OTA</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, Arial, sans-serif;
+      background: #f4f6f9;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .card {
+      background: white;
+      border-radius: 12px;
+      padding: 32px;
+      max-width: 480px;
+      width: 100%;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+    }
+    h1 { font-size: 22px; color: #1a1a2e; margin-bottom: 6px; }
+    .subtitle { font-size: 13px; color: #888; margin-bottom: 24px; }
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 0;
+      border-bottom: 1px solid #eee;
+      font-size: 14px;
+    }
+    .info-row:last-of-type { border-bottom: none; }
+    .label { color: #666; }
+    .value { font-weight: 600; color: #222; }
+    .status-box {
+      background: #f8f9ff;
+      border: 1px solid #e0e4ff;
+      border-radius: 8px;
+      padding: 16px;
+      margin: 20px 0;
+      font-size: 15px;
+      color: #333;
+      min-height: 52px;
+      display: flex;
+      align-items: center;
+    }
+    .dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: #ccc;
+      margin-right: 12px;
+      flex-shrink: 0;
+      transition: background 0.3s;
+    }
+    .dot.active   { background: #4caf50; }
+    .dot.working  { background: #ff9800; animation: blink 1s infinite; }
+    .dot.error    { background: #f44336; }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+    .btn {
+      width: 100%;
+      padding: 14px;
+      background: #3f51b5;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      cursor: pointer;
+      transition: background 0.2s;
+      margin-top: 8px;
+    }
+    .btn:hover:not(:disabled) { background: #303f9f; }
+    .btn:disabled { background: #9fa8da; cursor: not-allowed; }
+    .note { font-size: 12px; color: #aaa; text-align: center; margin-top: 12px; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <h1>Mise a jour OTA</h1>
+  <p class="subtitle">Arrosage Automatique — ESP32</p>
+
+  <div class="info-row">
+    <span class="label">Version actuelle</span>
+    <span class="value" id="ver">...</span>
+  </div>
+  <div class="info-row">
+    <span class="label">Adresse IP</span>
+    <span class="value" id="ip">...</span>
+  </div>
+
+  <div class="status-box">
+    <div class="dot" id="dot"></div>
+    <span id="status-text">Chargement...</span>
+  </div>
+
+  <button class="btn" id="btn-update" onclick="lancerUpdate()">
+    Verifier et mettre a jour
+  </button>
+  <p class="note" id="note">L'ESP32 redemarrera automatiquement apres la mise a jour.</p>
+</div>
+
+<script>
+  var polling = null;
+
+  function setDot(state) {
+    var d = document.getElementById('dot');
+    d.className = 'dot';
+    if (state === 'working') d.classList.add('working');
+    else if (state === 'ok')  d.classList.add('active');
+    else if (state === 'err') d.classList.add('error');
+  }
+
+  function updateUI() {
+    fetch('/status').then(function(r){ return r.text(); }).then(function(t){
+      document.getElementById('status-text').textContent = t;
+      var low = t.toLowerCase();
+      if (low.indexOf('cours') !== -1 || low.indexOf('recherche') !== -1) {
+        setDot('working');
+        document.getElementById('btn-update').disabled = true;
+      } else if (low.indexOf('terminee') !== -1) {
+        setDot('ok');
+        document.getElementById('note').textContent = 'Redemarrage en cours...';
+        stopPolling();
+      } else if (low.indexOf('erreur') !== -1) {
+        setDot('err');
+        document.getElementById('btn-update').disabled = false;
+        stopPolling();
+      } else {
+        setDot('');
+        document.getElementById('btn-update').disabled = false;
+        if (low.indexOf('disponible') !== -1) stopPolling();
+      }
+    }).catch(function(){});
+
+    fetch('/version').then(function(r){ return r.text(); }).then(function(t){
+      document.getElementById('ver').textContent = t;
+    }).catch(function(){});
+  }
+
+  function stopPolling() {
+    if (polling) { clearInterval(polling); polling = null; }
+  }
+
+  function lancerUpdate() {
+    document.getElementById('btn-update').disabled = true;
+    setDot('working');
+    document.getElementById('status-text').textContent = 'Demarrage...';
+    fetch('/update').catch(function(){});
+    polling = setInterval(updateUI, 2000);
+  }
+
+  // Affichage IP local
+  document.getElementById('ip').textContent = location.hostname;
+
+  // Rafraichissement initial
+  updateUI();
+  setInterval(updateUI, 8000);
+</script>
+</body>
+</html>
+)rawliteral";
 
 
 // ════════════════════════════════════════════════════════════
 //                          SETUP
 // ════════════════════════════════════════════════════════════
 void setup() {
-  delay(1500); // Laisse le temps à l'ESP32 et à l'alimentation de se stabiliser
+  delay(1500);
   Serial.begin(115200);
-  Serial.println("\n\n=== Arrosage Automatique ===");
+  Serial.println("\n\n=== Arrosage Automatique v" FW_VERSION " ===");
 
   // ── GPIO ──
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);  // Pompe OFF au démarrage (sécurité)
+  digitalWrite(RELAY_PIN, LOW);
 
   // ── OLED ──
   Wire.begin(21, 22);
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
-    Serial.println("[ERREUR] OLED non détecté !");
-    // On continue quand même, sans OLED
+    Serial.println("[ERREUR] OLED non detecte !");
   }
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-
-  oledPrint("== Arrosage Auto ==", "Demarrage...");
+  oledPrint("== Arrosage Auto ==", "v" FW_VERSION, "Demarrage...");
   delay(1000);
 
-  // ── Phase 2 : Connexion WiFi avec 3 tentatives ──
+  // ── WiFi ──
   bool wifiOk = connectWifi();
-
-  // ── Phase 2b : Mode config AP si 3 échecs ──
   if (!wifiOk) {
     startConfigPortal();
-    // startConfigPortal() est bloquante jusqu'à la config
-    // Après config → l'ESP32 redémarre automatiquement
   }
 
-  // Configuration MQTT : on s'abonne AU feed Pompe !
+  // ── Serveur web OTA ──
+  setupWebServer();
+  server.begin();
+  Serial.println("[WEB] Serveur HTTP demarre sur port 80");
+  Serial.print("[WEB] Adresse : http://");
+  Serial.println(WiFi.localIP());
+
+  // ── MQTT ──
   mqtt.subscribe(&pumpFeed);
-  
-  // ── Phase 3 : Connexion Adafruit IO ──
+  mqtt.subscribe(&programmeFeed);
   connectAdafruitIO();
 }
 
@@ -121,6 +339,17 @@ void setup() {
 //                          LOOP
 // ════════════════════════════════════════════════════════════
 void loop() {
+
+  // ── Traitement des requêtes HTTP (non bloquant) ──
+  server.handleClient();
+
+  // ── Déclenchement OTA si demandé via /update ──
+  if (otaRequested) {
+    otaRequested = false;
+    checkAndUpdate();   // Bloquant pendant le téléchargement
+    delay(5000);        // Laisser le résultat visible 5s sur l'écran
+    return;             // Reprend le loop proprement
+  }
 
   // ── Vérifier WiFi ──
   if (WiFi.status() != WL_CONNECTED) {
@@ -133,46 +362,279 @@ void loop() {
 
   // ── Maintenir connexion Adafruit IO ──
   if (!mqtt.connected()) {
-      Serial.println("[AIO] Perte de connexion MQTT. Reconnexion...");
-      aioConnected = false;
-      connectAdafruitIO();
+    Serial.println("[AIO] Perte de connexion MQTT. Reconnexion...");
+    aioConnected = false;
+    connectAdafruitIO();
   } else {
-      // ── Lecture des messages entrants (on bloque pnd 5000ms max) ──
-      // C'est ici que l'ESP32 va VRAIMENT écouter les messages envoyés par le Dashboard
-      Adafruit_MQTT_Subscribe *subscription;
-      
-      // On lit le flux avec un timeout de 5 secondes.
-      // S'il y a une valeur en attente (quand on clique ou quand on vient de se connecter),
-      // elle sera traitée ici.
-      while ((subscription = mqtt.readSubscription(5000))) {
-        if (subscription == &pumpFeed) {
-          
-          // Conversion de la charge utile en String
-          char* pValue = (char *)pumpFeed.lastread;
-          String value = String(pValue);
-          
-          Serial.println("\n-----------------------------------------");
-          Serial.print("📥 [AIO] MESSAGE RECU DU DASHBOARD : [");
-          Serial.print(value);
-          Serial.println("]");
-          Serial.println("-----------------------------------------");
-        
-          if (value == "1" || value == "ON" || value == "on") {
-            setPump(true);
+    Adafruit_MQTT_Subscribe *subscription;
+    while ((subscription = mqtt.readSubscription(5000))) {
+      if (subscription == &pumpFeed) {
+        char* pValue = (char *)pumpFeed.lastread;
+        String value = String(pValue);
+        Serial.println("\n-----------------------------------------");
+        Serial.print("[AIO] MESSAGE RECU : [");
+        Serial.print(value);
+        Serial.println("]");
+        Serial.println("-----------------------------------------");
+        if (value == "1" || value == "ON" || value == "on") {
+          setPump(true);
+        } else {
+          setPump(false);
+        }
+      } else if (subscription == &programmeFeed) {
+        String prog = String((char*)programmeFeed.lastread);
+        prog.trim();
+        Serial.print("[PROG] Recu: "); Serial.println(prog);
+        if (prog == "0" || prog.length() == 0) {
+          hasProgram = false;
+        } else {
+          int sp1 = prog.indexOf(' ');
+          int sp2 = prog.indexOf(' ', sp1 + 1);
+          if (sp1 > 0 && sp2 > sp1) {
+            prog.substring(0, sp1).toCharArray(nextWaterDate, sizeof(nextWaterDate));
+            prog.substring(sp1 + 1, sp2).toCharArray(nextWaterTime, sizeof(nextWaterTime));
+            prog.substring(sp2 + 1).toCharArray(nextWaterDur, sizeof(nextWaterDur));
+            hasProgram = true;
           } else {
-            setPump(false);
+            hasProgram = false;
           }
         }
       }
-      
-      // Ping obligatoire pour garder la connexion ouverte
-      if(! mqtt.ping()) {
-        mqtt.disconnect();
-      }
+    }
+    if (!mqtt.ping()) {
+      mqtt.disconnect();
+    }
   }
 
-  // ── Mise à jour OLED ──
+  // ── Resynchronisation NTP (toutes les 6h) ──
+  if (WiFi.status() == WL_CONNECTED && aioConnected) {
+    if (!timeSynced || (millis() - lastTimeSyncMs > 21600000UL)) {
+      syncTimeNow();
+    }
+  }
+
+  // ── OLED ──
   updateStatusScreen();
+}
+
+
+// ════════════════════════════════════════════════════════════
+//                   SERVEUR WEB — ROUTES
+// ════════════════════════════════════════════════════════════
+
+void setupWebServer() {
+  // Page principale
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/html", HTML_PAGE);
+  });
+
+  // Lance la vérification/mise à jour
+  server.on("/update", HTTP_GET, []() {
+    if (otaState == OTA_CHECKING || otaState == OTA_DOWNLOADING) {
+      server.send(200, "text/plain", "Mise a jour deja en cours...");
+      return;
+    }
+    otaRequested = true;
+    server.send(200, "text/plain", "Verification demarree");
+  });
+
+  // Retourne l'état OTA actuel (texte brut)
+  server.on("/status", HTTP_GET, []() {
+    server.send(200, "text/plain; charset=utf-8", otaMessage);
+  });
+
+  // Retourne la version locale
+  server.on("/version", HTTP_GET, []() {
+    server.send(200, "text/plain", FW_VERSION);
+  });
+
+  // 404
+  server.onNotFound([]() {
+    server.send(404, "text/plain", "Not found");
+  });
+}
+
+
+// ════════════════════════════════════════════════════════════
+//                   LOGIQUE OTA
+// ════════════════════════════════════════════════════════════
+
+// Met à jour l'état OTA + Serial + OLED
+void setOtaState(OtaState state, String detail) {
+  otaState = state;
+  switch (state) {
+    case OTA_IDLE:
+      otaMessage = "Inactif";
+      break;
+    case OTA_CHECKING:
+      otaMessage = "Recherche de mise a jour...";
+      oledPrint("== OTA ==", "Recherche...");
+      break;
+    case OTA_DOWNLOADING:
+      otaMessage = "Mise a jour en cours...";
+      oledPrint("== OTA ==", "Telechargement...");
+      break;
+    case OTA_SUCCESS:
+      otaMessage = "Mise a jour terminee";
+      oledPrint("== OTA ==", "Terminee!", "Redemarrage...");
+      break;
+    case OTA_NO_UPDATE:
+      otaMessage = "Aucune mise a jour disponible";
+      oledPrint("== OTA ==", "A jour !", "v" FW_VERSION);
+      break;
+    case OTA_ERROR:
+      otaMessage = "Erreur: " + (detail.length() ? detail : "inconnue");
+      oledPrint("== OTA ERREUR ==", detail);
+      break;
+  }
+  Serial.println("[OTA] Etat : " + otaMessage);
+}
+
+// Télécharge version.txt depuis GitHub et retourne la version distante
+String getRemoteVersion() {
+  WiFiClientSecure secClient;
+  secClient.setInsecure();  // Pas de vérification du certificat (pratique pour GitHub RAW)
+  secClient.setTimeout(10);
+
+  HTTPClient http;
+  http.begin(secClient, OTA_VERSION_URL);
+  http.setTimeout(10000);
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("[OTA] Erreur HTTP version.txt : %d\n", code);
+    http.end();
+    return "";
+  }
+
+  String ver = http.getString();
+  http.end();
+  ver.trim();
+  return ver;
+}
+
+// Compare deux versions X.Y.Z — retourne true si remoteVer > localVer
+bool isNewerVersion(const String& remoteVer, const String& localVer) {
+  int rMaj = 0, rMin = 0, rPat = 0;
+  int lMaj = 0, lMin = 0, lPat = 0;
+  sscanf(remoteVer.c_str(), "%d.%d.%d", &rMaj, &rMin, &rPat);
+  sscanf(localVer.c_str(), "%d.%d.%d", &lMaj, &lMin, &lPat);
+
+  if (rMaj != lMaj) return rMaj > lMaj;
+  if (rMin != lMin) return rMin > lMin;
+  return rPat > lPat;
+}
+
+// Télécharge firmware.bin et l'écrit en flash via la lib Update
+void performOTA() {
+  setOtaState(OTA_DOWNLOADING);
+
+  WiFiClientSecure secClient;
+  secClient.setInsecure();
+  secClient.setTimeout(OTA_TIMEOUT_MS / 1000);
+
+  HTTPClient http;
+  http.begin(secClient, OTA_FIRMWARE_URL);
+  http.setTimeout(OTA_TIMEOUT_MS);
+
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    setOtaState(OTA_ERROR, "HTTP " + String(httpCode));
+    http.end();
+    return;
+  }
+
+  int contentLength = http.getSize();
+  Serial.printf("[OTA] Taille firmware : %d bytes\n", contentLength);
+
+  if (contentLength <= 0) {
+    setOtaState(OTA_ERROR, "Taille inconnue");
+    http.end();
+    return;
+  }
+
+  if (!Update.begin(contentLength, U_FLASH)) {
+    String err = Update.errorString();
+    setOtaState(OTA_ERROR, err);
+    http.end();
+    return;
+  }
+
+  // Écriture en streaming (évite de charger le binaire entier en RAM)
+  WiFiClient* stream = http.getStreamPtr();
+  uint8_t buf[512];
+  int written = 0;
+  unsigned long startMs = millis();
+
+  while (http.connected() && written < contentLength) {
+    if (millis() - startMs > OTA_TIMEOUT_MS) {
+      Update.abort();
+      setOtaState(OTA_ERROR, "Timeout");
+      http.end();
+      return;
+    }
+    int available = stream->available();
+    if (available > 0) {
+      int toRead = min(available, (int)sizeof(buf));
+      int r = stream->readBytes(buf, toRead);
+      int w = Update.write(buf, r);
+      if (w != r) {
+        Update.abort();
+        setOtaState(OTA_ERROR, "Ecriture echouee");
+        http.end();
+        return;
+      }
+      written += w;
+
+      // Progression toutes les 50 ko
+      if (written % (50 * 1024) < sizeof(buf)) {
+        Serial.printf("[OTA] %d / %d bytes (%.0f%%)\n",
+          written, contentLength, 100.0f * written / contentLength);
+      }
+    }
+    delay(1);
+  }
+
+  http.end();
+
+  if (written != contentLength) {
+    Update.abort();
+    setOtaState(OTA_ERROR, "Transfert incomplet");
+    return;
+  }
+
+  if (!Update.end(true)) {
+    setOtaState(OTA_ERROR, Update.errorString());
+    return;
+  }
+
+  setOtaState(OTA_SUCCESS);
+  Serial.println("[OTA] Redemarrage dans 3 secondes...");
+  delay(3000);
+  ESP.restart();
+}
+
+// Point d'entrée OTA : vérifie la version puis lance la mise à jour si nécessaire
+void checkAndUpdate() {
+  setOtaState(OTA_CHECKING);
+
+  String remoteVer = getRemoteVersion();
+  if (remoteVer.length() == 0) {
+    setOtaState(OTA_ERROR, "Impossible de lire version.txt");
+    return;
+  }
+
+  Serial.printf("[OTA] Version locale : %s — Version distante : %s\n",
+                FW_VERSION, remoteVer.c_str());
+
+  if (!isNewerVersion(remoteVer, FW_VERSION)) {
+    setOtaState(OTA_NO_UPDATE);
+    oledPrint("== OTA ==", "A jour!", "Local:  v" FW_VERSION, "Dist:   v" + remoteVer);
+    return;
+  }
+
+  Serial.printf("[OTA] Nouvelle version disponible : %s\n", remoteVer.c_str());
+  performOTA();
 }
 
 
@@ -180,130 +642,81 @@ void loop() {
 //                   FONCTIONS WIFI
 // ════════════════════════════════════════════════════════════
 
-// Tente de se connecter au WiFi enregistré (3 essais max)
 bool connectWifi() {
   for (int attempt = 1; attempt <= WIFI_MAX_RETRIES; attempt++) {
     Serial.printf("[WiFi] Tentative %d/%d...\n", attempt, WIFI_MAX_RETRIES);
-
-    oledPrint(
-      "== Arrosage Auto ==",
-      "WiFi: connexion...",
-      "Tentative " + String(attempt) + "/" + String(WIFI_MAX_RETRIES)
-    );
-
+    showWifiConnecting(attempt);
     WiFi.mode(WIFI_STA);
-    WiFi.begin();  // Utilise les credentials sauvegardés en Flash
-
+    WiFi.begin();
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_RETRY_DELAY) {
       delay(200);
     }
-
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("[WiFi] Connecté ! IP : " + WiFi.localIP().toString());
-      oledPrint(
-        "== Arrosage Auto ==",
-        "WiFi: OK",
-        WiFi.localIP().toString()
-      );
+      Serial.println("[WiFi] Connecte ! IP : " + WiFi.localIP().toString());
+      oledPrint("== Arrosage Auto ==", "WiFi: OK", WiFi.localIP().toString());
       delay(1500);
       return true;
     }
-
     Serial.printf("[WiFi] Tentative %d echouee.\n", attempt);
   }
-
   Serial.println("[WiFi] 3 tentatives echouees → mode config");
   return false;
 }
 
-// Lance le point d'accès WiFiManager pour configurer le WiFi
-// Bloquant jusqu'à ce que l'utilisateur entre les credentials
 void startConfigPortal() {
   Serial.println("[WiFiManager] Demarrage du portail de config...");
-
-  oledPrint(
-    "MODE CONFIG",
-    "WiFi: " + String(AP_SSID),
-    "IP: 192.168.4.1",
-    "Ouvre navigateur"
-  );
-
-  // IP statique du portail
+  showWifiConfigPortal();
   wifiManager.setAPStaticIPConfig(
     IPAddress(192, 168, 4, 1),
     IPAddress(192, 168, 4, 1),
     IPAddress(255, 255, 255, 0)
   );
-
-  // Timeout : si personne ne se connecte en 5 min → reboot
   wifiManager.setConfigPortalTimeout(300);
-
-  // Lance le portail (bloquant)
   bool configured = wifiManager.startConfigPortal(AP_SSID);
-
   if (configured) {
-    Serial.println("[WiFiManager] Config OK → redemarrage...");
     oledPrint("Config WiFi OK!", "Redemarrage...");
-    delay(2000);
-    ESP.restart();
   } else {
-    Serial.println("[WiFiManager] Timeout → redemarrage...");
     oledPrint("Timeout config", "Redemarrage...");
-    delay(2000);
-    ESP.restart();
   }
+  delay(2000);
+  ESP.restart();
 }
 
 
 // ════════════════════════════════════════════════════════════
-//                   FONCTIONS ADAFRUIT IO
+//                   ADAFRUIT IO
 // ════════════════════════════════════════════════════════════
 
-// Connexion au broker MQTT Adafruit IO (via librairie standard)
 void connectAdafruitIO() {
   Serial.println("[AIO] Connexion Adafruit IO (MQTT)...");
-  oledPrint(
-    "== Arrosage Auto ==",
-    "WiFi: OK",
-    "Connexion AIO..."
-  );
+  oledPrint("== Arrosage Auto ==", "WiFi: OK", "Connexion AIO...");
 
   int8_t ret;
   int retries = 5;
-
-  // On boucle jusqu'à ce que l'on soit connecté
   while ((ret = mqtt.connect()) != 0) {
-       Serial.print("[AIO] Echec: ");
-       Serial.println(mqtt.connectErrorString(ret));
-       Serial.println("[AIO] Nouvelle tentative dans 5 secondes...");
-       
-       oledPrint(
-         "== AIO ERREUR ==",
-         String(mqtt.connectErrorString(ret)),
-         "Reessai dans 5s"
-       );
-       
-       mqtt.disconnect();
-       delay(5000);
-       retries--;
-       
-       if (retries == 0) {
-         Serial.println("❌ ECHEC DEFINITIF DE CONNEXION ❌");
-         oledPrint("== AIO ERREUR ==", "Echec critique", "Prog. stope");
-         while (1) { delay(1000); }
-       }
+    Serial.print("[AIO] Echec: ");
+    Serial.println(mqtt.connectErrorString(ret));
+    oledPrint("== AIO ERREUR ==", String(mqtt.connectErrorString(ret)), "Reessai dans 5s");
+    mqtt.disconnect();
+    delay(5000);
+    retries--;
+    if (retries == 0) {
+      Serial.println("ECHEC DEFINITIF DE CONNEXION AIO");
+      oledPrint("== AIO ERREUR ==", "Echec critique", "Prog. stope");
+      while (1) { delay(1000); }
+    }
   }
 
-  Serial.println("[AIO] Connecté avec succès !");
+  Serial.println("[AIO] Connecte avec succes !");
   aioConnected = true;
-  
-  // 🔥 ASTUCE ADAFRUIT IO : on publie un octet nul sur le topic /get
-  // pour forcer le serveur à nous renvoyer IMMÉDIATEMENT 
-  // la dernière valeur du feed "pompe"
-  Serial.println("[AIO] Demande de la dernière valeur...");
-  pumpGet.publish("\0");
 
+  if (WiFi.status() == WL_CONNECTED) {
+    syncTimeNow();
+  }
+
+  pumpGet.publish("\0");
+  programmeGet.publish("\0");
   updateStatusScreen();
 }
 
@@ -313,22 +726,51 @@ void connectAdafruitIO() {
 // ════════════════════════════════════════════════════════════
 
 void setPump(bool state) {
+  bool previousState = pumpRunning;
   pumpRunning = state;
   digitalWrite(RELAY_PIN, state ? HIGH : LOW);
-  Serial.println(state ? "[POMPE] ON  — Relais fermé" : "[POMPE] OFF — Relais ouvert");
+  Serial.println(state ? "[POMPE] ON" : "[POMPE] OFF");
 
-  // Publier l'état réel vers Adafruit IO (feed "pompe_etat")
-  // → visible sur le dashboard comme confirmation
   if (aioConnected) {
-    if (stateFeed.publish(state ? "1" : "0")) {
-      Serial.println("[AIO] pompe_etat publié : " + String(state ? "1" : "0"));
-    } else {
+    if (!stateFeed.publish(state ? "1" : "0")) {
       Serial.println("[AIO] Erreur publication pompe_etat !");
     }
   }
 
-  // Mettre à jour l'écran immédiatement
+  if (previousState != state) {
+    showPumpStatusChange(state);
+  }
   updateStatusScreen();
+}
+
+bool syncTimeNow() {
+  Serial.println("[TIME] Synchronisation NTP...");
+  configTzTime("CET-1CEST,M3.5.0/2,M10.5.0/3", "pool.ntp.org", "time.nist.gov", "time.google.com");
+  struct tm timeInfo;
+  for (int i = 0; i < 10; i++) {
+    if (getLocalTime(&timeInfo, 1200)) {
+      timeSynced = true;
+      lastTimeSyncMs = millis();
+      Serial.println("[TIME] Heure synchronisee.");
+      return true;
+    }
+    delay(200);
+  }
+  timeSynced = false;
+  Serial.println("[TIME] Echec synchronisation NTP.");
+  return false;
+}
+
+String getCurrentTimeString() {
+  if (!timeSynced) return "--:--:--";
+  struct tm timeInfo;
+  if (!getLocalTime(&timeInfo, 100)) {
+    timeSynced = false;
+    return "--:--:--";
+  }
+  char buffer[16];
+  strftime(buffer, sizeof(buffer), "%H:%M:%S", &timeInfo);
+  return String(buffer);
 }
 
 
@@ -336,49 +778,148 @@ void setPump(bool state) {
 //                   AFFICHAGE OLED
 // ════════════════════════════════════════════════════════════
 
-// Affiche jusqu'à 4 lignes sur l'OLED
 void oledPrint(String line1, String line2, String line3, String line4) {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
-
   display.println(line1);
   if (line2 != "") display.println(line2);
   if (line3 != "") display.println(line3);
   if (line4 != "") display.println(line4);
-
   display.display();
 }
 
-// Écran de statut normal (fonctionnement)
-void updateStatusScreen() {
+void showPumpStatusChange(bool state) {
   display.clearDisplay();
-  display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.setCursor(28, 0);
+  display.print("STATUT POMPE");
+  display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
 
-  // Ligne 1 : titre
-  display.println("== Arrosage Auto ==");
+  display.setTextSize(3);
+  if (state) {
+    display.fillRect(24, 14, 80, 28, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+    display.setCursor(28, 16);
+    display.print(" ON ");
+    display.setTextColor(SSD1306_WHITE);
+  } else {
+    display.drawRect(24, 14, 80, 28, SSD1306_WHITE);
+    display.setCursor(28, 16);
+    display.print(" OFF");
+  }
 
-  // Ligne 2 : WiFi
-  display.print("WiFi: ");
-  display.println(WiFi.status() == WL_CONNECTED ? "OK" : "NON");
+  struct tm _ti;
+  char _tbuf[6];
+  strcpy(_tbuf, "--:--");
+  if (timeSynced && getLocalTime(&_ti, 100)) {
+    sprintf(_tbuf, "%02d:%02d", _ti.tm_hour, _ti.tm_min);
+  }
+  display.setTextSize(1);
+  display.setCursor(43, 54);
+  display.print("a ");
+  display.print(_tbuf);
+  display.display();
+  delay(1800);
+}
 
-  // Ligne 3 : Adafruit IO
-  display.print("AIO:  ");
-  display.println(aioConnected ? "OK" : "NON");
+void showWifiConnecting(int attempt) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(13, 0);
+  display.print("WiFi en cours...");
+  display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+  display.setCursor(0, 15);
+  display.print("Tentative ");
+  display.print(attempt);
+  display.print(" / ");
+  display.print(WIFI_MAX_RETRIES);
+  display.drawRect(0, 28, 128, 10, SSD1306_WHITE);
+  int barFill = (128 * attempt) / WIFI_MAX_RETRIES;
+  display.fillRect(0, 28, barFill, 10, SSD1306_WHITE);
+  display.setCursor(20, 46);
+  display.print("Connexion");
+  for (int i = 0; i < attempt; i++) display.print(".");
+  display.display();
+}
 
-  // Ligne 4 : IP
-  display.print("IP: ");
-  display.println(WiFi.localIP().toString());
+void showWifiConfigPortal() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(4, 0);
+  display.print("! WiFi impossible !");
+  display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+  display.setCursor(0, 14);
+  display.print("SSID: ");
+  display.print(AP_SSID);
+  display.setCursor(0, 26);
+  display.print("MDP:  aucun");
+  display.setCursor(0, 38);
+  display.print("IP:   192.168.4.1");
+  display.setCursor(0, 52);
+  display.print("Ouvre ton navigateur");
+  display.display();
+}
 
-  // Ligne 5 : état pompe (grande taille)
-  display.drawLine(0, 40, 127, 40, SSD1306_WHITE);
-  display.setTextSize(2);
-  display.setCursor(0, 45);
-  display.print("Pompe:");
-  display.println(pumpRunning ? " ON" : "OFF");
+void updateStatusScreen() {
+  static const char* moisFR[] = {
+    "Janvier", "Fevrier", "Mars",    "Avril",   "Mai",      "Juin",
+    "Juillet", "Aout",   "Septembre","Octobre", "Novembre", "Decembre"
+  };
+
+  struct tm timeInfo;
+  bool hasTime = timeSynced && getLocalTime(&timeInfo, 100);
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+  if (hasTime) {
+    char dateBuf[24];
+    sprintf(dateBuf, "%d %s %d",
+      timeInfo.tm_mday, moisFR[timeInfo.tm_mon], 1900 + timeInfo.tm_year);
+    int dateW = strlen(dateBuf) * 6;
+    display.setCursor((128 - dateW) / 2, 1);
+    display.print(dateBuf);
+  } else {
+    display.setCursor(5, 1);
+    display.print("Synchro en cours...");
+  }
+
+  display.drawLine(0, 11, 127, 11, SSD1306_WHITE);
+
+  display.setTextSize(3);
+  char timeBuf[6];
+  if (hasTime) {
+    sprintf(timeBuf, "%02d:%02d", timeInfo.tm_hour, timeInfo.tm_min);
+  } else {
+    strcpy(timeBuf, "--:--");
+  }
+  display.setCursor(19, 15);
+  display.print(timeBuf);
+
+  display.drawLine(0, 43, 127, 43, SSD1306_WHITE);
+
+  display.setTextSize(1);
+  if (!hasProgram) {
+    display.setCursor(19, 52);
+    display.print("Aucun programme");
+  } else {
+    display.setCursor(1, 45);
+    display.print("Prochain arrosage:");
+    display.setCursor(1, 55);
+    display.print(nextWaterDate);
+    display.print(" a ");
+    display.print(nextWaterTime);
+    if (nextWaterDur[0] != '\0') {
+      display.print(" ");
+      display.print(nextWaterDur);
+    }
+  }
 
   display.display();
 }
