@@ -69,6 +69,7 @@ Adafruit_MQTT_Publish   pumpGet      = Adafruit_MQTT_Publish(&mqtt,   IO_USERNAM
 Adafruit_MQTT_Publish   stateFeed    = Adafruit_MQTT_Publish(&mqtt,   IO_USERNAME "/feeds/pompe_etat");
 Adafruit_MQTT_Subscribe programmeFeed = Adafruit_MQTT_Subscribe(&mqtt, IO_USERNAME "/feeds/programme");
 Adafruit_MQTT_Publish   programmeGet  = Adafruit_MQTT_Publish(&mqtt,  IO_USERNAME "/feeds/programme/get");
+Adafruit_MQTT_Publish   alertFeed     = Adafruit_MQTT_Publish(&mqtt,  IO_USERNAME "/feeds/alerte");
 
 // ─────────────────────────────────────────
 //   État global — Arrosage
@@ -98,6 +99,7 @@ enum OtaState {
 OtaState otaState     = OTA_IDLE;
 String   otaMessage   = "Inactif";
 bool     otaRequested = false;  // Flag déclenché par GET /update
+String   systemAlert  = "";    // Dernière alerte critique système
 
 // ─────────────────────────────────────────
 //   Prototypes
@@ -114,6 +116,7 @@ void     showPumpStatusChange(bool state);
 void     showWifiConnecting(int attempt);
 void     showWifiConfigPortal();
 
+void     criticalError(String msg);
 void     setupWebServer();
 void     setOtaState(OtaState state, String detail = "");
 void     checkAndUpdate();
@@ -228,6 +231,7 @@ static const char HTML_PAGE[] PROGMEM = R"rawliteral(
     Verifier et mettre a jour
   </button>
   <p class="note" id="note">L'ESP32 redemarrera automatiquement apres la mise a jour.</p>
+  <div id="alert-banner" style="display:none;background:#ffebee;border:1px solid #f44336;border-radius:8px;padding:12px 16px;margin-top:16px;color:#c62828;font-size:14px;font-weight:600;">&#9888; <span id="alert-text"></span></div>
 </div>
 
 <script>
@@ -283,9 +287,23 @@ static const char HTML_PAGE[] PROGMEM = R"rawliteral(
   // Affichage IP local
   document.getElementById('ip').textContent = location.hostname;
 
+  function checkAlert() {
+    fetch('/alert').then(function(r){ return r.text(); }).then(function(t){
+      var banner = document.getElementById('alert-banner');
+      if (t && t.trim().length > 0) {
+        document.getElementById('alert-text').textContent = t.trim();
+        banner.style.display = 'block';
+      } else {
+        banner.style.display = 'none';
+      }
+    }).catch(function(){});
+  }
+
   // Rafraichissement initial
   updateUI();
+  checkAlert();
   setInterval(updateUI, 8000);
+  setInterval(checkAlert, 5000);
 </script>
 </body>
 </html>
@@ -302,7 +320,7 @@ void setup() {
 
   // ── GPIO ──
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(RELAY_PIN, HIGH); // Relais actif-bas : HIGH = pompe OFF au démarrage
 
   // ── OLED ──
   Wire.begin(21, 22);
@@ -362,7 +380,7 @@ void loop() {
 
   // ── Maintenir connexion Adafruit IO ──
   if (!mqtt.connected()) {
-    Serial.println("[AIO] Perte de connexion MQTT. Reconnexion...");
+    Serial.printf("[AIO] Perte de connexion MQTT (status WiFi=%d). Reconnexion...\n", WiFi.status());
     aioConnected = false;
     connectAdafruitIO();
   } else {
@@ -448,10 +466,47 @@ void setupWebServer() {
     server.send(200, "text/plain", FW_VERSION);
   });
 
+  // Alerte système courante
+  server.on("/alert", HTTP_GET, []() {
+    server.send(200, "text/plain; charset=utf-8", systemAlert);
+  });
+
   // 404
   server.onNotFound([]() {
     server.send(404, "text/plain", "Not found");
   });
+}
+
+
+// ════════════════════════════════════════════════════════════
+//                   ERREUR CRITIQUE
+// ════════════════════════════════════════════════════════════
+
+void criticalError(String msg) {
+  Serial.println("[CRITIQUE] " + msg);
+  systemAlert = msg;
+
+  // Couper la pompe immédiatement (accès direct GPIO, sans MQTT)
+  pumpRunning = false;
+  digitalWrite(RELAY_PIN, HIGH);
+  Serial.println("[CRITIQUE] Pompe forcee OFF.");
+
+  // Affichage OLED
+  oledPrint("!! ERREUR CRITIQUE !!", msg.substring(0, 21), "Pompe: OFF", "Reboot dans 15s");
+
+  // Tentative de publication sur Adafruit IO (best-effort)
+  if (WiFi.status() == WL_CONNECTED && mqtt.connected()) {
+    alertFeed.publish(msg.c_str());
+    stateFeed.publish("0");
+    Serial.println("[CRITIQUE] Alerte publiee sur Adafruit IO.");
+  } else {
+    Serial.println("[CRITIQUE] Pas de connexion — alerte non publiee sur AIO.");
+  }
+
+  // Attente avant redémarrage (la page web reste accessible)
+  delay(15000);
+  Serial.println("[CRITIQUE] Redemarrage...");
+  ESP.restart();
 }
 
 
@@ -643,6 +698,7 @@ void checkAndUpdate() {
 // ════════════════════════════════════════════════════════════
 
 bool connectWifi() {
+  Serial.printf("[WiFi] SSID cible : %s\n", WiFi.SSID().c_str());
   for (int attempt = 1; attempt <= WIFI_MAX_RETRIES; attempt++) {
     Serial.printf("[WiFi] Tentative %d/%d...\n", attempt, WIFI_MAX_RETRIES);
     showWifiConnecting(attempt);
@@ -653,14 +709,17 @@ bool connectWifi() {
       delay(200);
     }
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("[WiFi] Connecte ! IP : " + WiFi.localIP().toString());
+      Serial.printf("[WiFi] Connecte ! SSID: %s | IP: %s | RSSI: %d dBm\n",
+                    WiFi.SSID().c_str(),
+                    WiFi.localIP().toString().c_str(),
+                    WiFi.RSSI());
       oledPrint("== Arrosage Auto ==", "WiFi: OK", WiFi.localIP().toString());
       delay(1500);
       return true;
     }
-    Serial.printf("[WiFi] Tentative %d echouee.\n", attempt);
+    Serial.printf("[WiFi] Tentative %d/%d echouee (status=%d)\n", attempt, WIFI_MAX_RETRIES, WiFi.status());
   }
-  Serial.println("[WiFi] 3 tentatives echouees → mode config");
+  Serial.println("[WiFi] Toutes les tentatives echouees → mode config");
   return false;
 }
 
@@ -673,10 +732,13 @@ void startConfigPortal() {
     IPAddress(255, 255, 255, 0)
   );
   wifiManager.setConfigPortalTimeout(300);
+  Serial.printf("[WiFiManager] AP SSID: %s | IP: 192.168.4.1 | Timeout: 300s\n", AP_SSID);
   bool configured = wifiManager.startConfigPortal(AP_SSID);
   if (configured) {
+    Serial.println("[WiFiManager] Configuration reussie ! Redemarrage...");
     oledPrint("Config WiFi OK!", "Redemarrage...");
   } else {
+    Serial.println("[WiFiManager] Timeout du portail. Redemarrage...");
     oledPrint("Timeout config", "Redemarrage...");
   }
   delay(2000);
@@ -689,26 +751,27 @@ void startConfigPortal() {
 // ════════════════════════════════════════════════════════════
 
 void connectAdafruitIO() {
-  Serial.println("[AIO] Connexion Adafruit IO (MQTT)...");
+  Serial.printf("[AIO] Connexion Adafruit IO (MQTT) — serveur: %s:%d — user: %s\n",
+                AIO_SERVER, AIO_SERVERPORT, IO_USERNAME);
   oledPrint("== Arrosage Auto ==", "WiFi: OK", "Connexion AIO...");
 
   int8_t ret;
   int retries = 5;
+  int attempt = 0;
   while ((ret = mqtt.connect()) != 0) {
-    Serial.print("[AIO] Echec: ");
-    Serial.println(mqtt.connectErrorString(ret));
+    attempt++;
+    Serial.printf("[AIO] Echec tentative %d/5 (code=%d) : %s\n",
+                  attempt, ret, mqtt.connectErrorString(ret));
     oledPrint("== AIO ERREUR ==", String(mqtt.connectErrorString(ret)), "Reessai dans 5s");
     mqtt.disconnect();
     delay(5000);
     retries--;
     if (retries == 0) {
-      Serial.println("ECHEC DEFINITIF DE CONNEXION AIO");
-      oledPrint("== AIO ERREUR ==", "Echec critique", "Prog. stope");
-      while (1) { delay(1000); }
+      criticalError("Echec connexion AIO (5/5)");
     }
   }
 
-  Serial.println("[AIO] Connecte avec succes !");
+  Serial.printf("[AIO] Connecte avec succes apres %d tentative(s) !\n", attempt + 1);
   aioConnected = true;
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -728,7 +791,7 @@ void connectAdafruitIO() {
 void setPump(bool state) {
   bool previousState = pumpRunning;
   pumpRunning = state;
-  digitalWrite(RELAY_PIN, state ? HIGH : LOW);
+  digitalWrite(RELAY_PIN, state ? LOW : HIGH);
   Serial.println(state ? "[POMPE] ON" : "[POMPE] OFF");
 
   if (aioConnected) {
