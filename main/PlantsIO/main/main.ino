@@ -16,6 +16,7 @@
 #include <WiFiClientSecure.h>
 #include <Update.h>
 #include <WebServer.h>
+#include "secrets.h"
 
 // ─────────────────────────────────────────
 //   Adafruit IO
@@ -54,9 +55,7 @@
 // Version locale du firmware (format X.Y.Z)
 #define FW_VERSION        "1.0.0"
 
-// URLs RAW GitHub (format : raw.githubusercontent.com/USER/REPO/BRANCHE/fichier)
-#define OTA_VERSION_URL   "https://raw.githubusercontent.com/GabrielC0/PlantsIO.ino/main/main/PlantsIO/main/version.txt"
-#define OTA_FIRMWARE_URL  "https://raw.githubusercontent.com/GabrielC0/PlantsIO.ino/main/main/PlantsIO/main/firmware.bin"
+// OTA_VERSION_URL, OTA_FIRMWARE_URL → secrets.h
 
 // Timeout téléchargement (ms)
 #define OTA_TIMEOUT_MS    60000
@@ -962,7 +961,10 @@ bool connectWifi() {
   for (int attempt = 1; attempt <= WIFI_MAX_RETRIES; attempt++) {
     Serial.printf("[WiFi] Tentative %d/%d...\n", attempt, WIFI_MAX_RETRIES);
     showWifiConnecting(attempt);
+    WiFi.disconnect(true);
+    delay(300);
     WiFi.mode(WIFI_STA);
+    delay(100);
     WiFi.begin();
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_RETRY_DELAY) {
