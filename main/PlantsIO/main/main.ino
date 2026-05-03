@@ -135,108 +135,212 @@ static const char HTML_PAGE[] PROGMEM = R"rawliteral(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ESP32 – Mise a jour OTA</title>
+  <title>Arrosage Automatique</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: -apple-system, Arial, sans-serif;
       background: #f4f6f9;
       min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      padding: 24px 12px;
     }
+    .page { max-width: 520px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
     .card {
       background: white;
       border-radius: 12px;
-      padding: 32px;
-      max-width: 480px;
-      width: 100%;
-      box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+      padding: 24px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.08);
     }
-    h1 { font-size: 22px; color: #1a1a2e; margin-bottom: 6px; }
-    .subtitle { font-size: 13px; color: #888; margin-bottom: 24px; }
+    .card-title {
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: #888;
+      margin-bottom: 16px;
+    }
+    h1 { font-size: 20px; color: #1a1a2e; margin-bottom: 2px; }
+    .subtitle { font-size: 13px; color: #aaa; margin-bottom: 0; }
     .info-row {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding: 10px 0;
-      border-bottom: 1px solid #eee;
+      padding: 8px 0;
+      border-bottom: 1px solid #f0f0f0;
       font-size: 14px;
     }
     .info-row:last-of-type { border-bottom: none; }
-    .label { color: #666; }
+    .label { color: #888; }
     .value { font-weight: 600; color: #222; }
+    /* Pompe toggle */
+    .pump-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    .pump-label { font-size: 15px; font-weight: 600; color: #333; }
+    .pump-sub { font-size: 12px; color: #aaa; margin-top: 2px; }
+    .toggle-wrap { position: relative; width: 56px; height: 30px; flex-shrink: 0; }
+    .toggle-wrap input { opacity: 0; width: 0; height: 0; position: absolute; }
+    .slider {
+      position: absolute; inset: 0;
+      background: #ccc;
+      border-radius: 30px;
+      cursor: pointer;
+      transition: background .3s;
+    }
+    .slider:before {
+      content: '';
+      position: absolute;
+      width: 22px; height: 22px;
+      left: 4px; bottom: 4px;
+      background: white;
+      border-radius: 50%;
+      transition: transform .3s;
+      box-shadow: 0 1px 4px rgba(0,0,0,.2);
+    }
+    input:checked + .slider { background: #4caf50; }
+    input:checked + .slider:before { transform: translateX(26px); }
+    /* Indicateur état */
+    .indicator-row { display: flex; align-items: center; gap: 12px; }
+    .ind-dot {
+      width: 14px; height: 14px;
+      border-radius: 50%;
+      background: #ccc;
+      flex-shrink: 0;
+      transition: background .3s;
+    }
+    .ind-dot.on  { background: #4caf50; box-shadow: 0 0 6px #4caf5088; }
+    .ind-dot.off { background: #ef5350; }
+    .ind-text { font-size: 15px; font-weight: 600; color: #333; }
+    .ind-sub { font-size: 12px; color: #aaa; }
+    /* OTA */
     .status-box {
       background: #f8f9ff;
       border: 1px solid #e0e4ff;
       border-radius: 8px;
-      padding: 16px;
-      margin: 20px 0;
-      font-size: 15px;
+      padding: 14px;
+      margin-bottom: 14px;
+      font-size: 14px;
       color: #333;
-      min-height: 52px;
       display: flex;
       align-items: center;
+      gap: 10px;
     }
     .dot {
       width: 10px; height: 10px;
       border-radius: 50%;
       background: #ccc;
-      margin-right: 12px;
       flex-shrink: 0;
-      transition: background 0.3s;
     }
-    .dot.active   { background: #4caf50; }
-    .dot.working  { background: #ff9800; animation: blink 1s infinite; }
-    .dot.error    { background: #f44336; }
-    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+    .dot.active  { background: #4caf50; }
+    .dot.working { background: #ff9800; animation: blink 1s infinite; }
+    .dot.error   { background: #f44336; }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.2} }
     .btn {
       width: 100%;
-      padding: 14px;
+      padding: 13px;
       background: #3f51b5;
       color: white;
       border: none;
       border-radius: 8px;
-      font-size: 15px;
+      font-size: 14px;
       cursor: pointer;
-      transition: background 0.2s;
-      margin-top: 8px;
+      transition: background .2s;
     }
     .btn:hover:not(:disabled) { background: #303f9f; }
     .btn:disabled { background: #9fa8da; cursor: not-allowed; }
-    .note { font-size: 12px; color: #aaa; text-align: center; margin-top: 12px; }
+    .note { font-size: 12px; color: #aaa; text-align: center; margin-top: 10px; }
+    /* Alerte */
+    .alert-box {
+      display: none;
+      background: #ffebee;
+      border: 1px solid #f44336;
+      border-radius: 8px;
+      padding: 12px 16px;
+      color: #c62828;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    /* Programme */
+    .prog-box {
+      background: #f8fdf8;
+      border: 1px solid #c8e6c9;
+      border-radius: 8px;
+      padding: 14px;
+      font-size: 14px;
+      color: #333;
+      min-height: 48px;
+    }
+    .prog-box.empty { color: #aaa; font-style: italic; }
   </style>
 </head>
 <body>
-<div class="card">
-  <h1>Mise a jour OTA</h1>
-  <p class="subtitle">Arrosage Automatique — ESP32</p>
+<div class="page">
 
-  <div class="info-row">
-    <span class="label">Version actuelle</span>
-    <span class="value" id="ver">...</span>
-  </div>
-  <div class="info-row">
-    <span class="label">Adresse IP</span>
-    <span class="value" id="ip">...</span>
+  <!-- En-tête -->
+  <div class="card">
+    <h1>Arrosage Automatique</h1>
+    <p class="subtitle" id="ip">...</p>
   </div>
 
-  <div class="status-box">
-    <div class="dot" id="dot"></div>
-    <span id="status-text">Chargement...</span>
+  <!-- Alerte critique -->
+  <div class="alert-box" id="alert-banner">&#9888; <span id="alert-text"></span></div>
+
+  <!-- Commande pompe -->
+  <div class="card">
+    <div class="card-title">Commande</div>
+    <div class="pump-row">
+      <div>
+        <div class="pump-label">Pompe</div>
+        <div class="pump-sub">Allumer / Eteindre manuellement</div>
+      </div>
+      <label class="toggle-wrap">
+        <input type="checkbox" id="pump-toggle" onchange="togglePump(this)">
+        <span class="slider"></span>
+      </label>
+    </div>
   </div>
 
-  <button class="btn" id="btn-update" onclick="lancerUpdate()">
-    Verifier et mettre a jour
-  </button>
-  <p class="note" id="note">L'ESP32 redemarrera automatiquement apres la mise a jour.</p>
-  <div id="alert-banner" style="display:none;background:#ffebee;border:1px solid #f44336;border-radius:8px;padding:12px 16px;margin-top:16px;color:#c62828;font-size:14px;font-weight:600;">&#9888; <span id="alert-text"></span></div>
+  <!-- Etat reel pompe -->
+  <div class="card">
+    <div class="card-title">Etat reel</div>
+    <div class="indicator-row">
+      <div class="ind-dot" id="ind-dot"></div>
+      <div>
+        <div class="ind-text" id="ind-text">...</div>
+        <div class="ind-sub">Retour de l'ESP32</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Programme -->
+  <div class="card">
+    <div class="card-title">Prochain arrosage programme</div>
+    <div class="prog-box empty" id="prog-box">Chargement...</div>
+  </div>
+
+  <!-- OTA -->
+  <div class="card">
+    <div class="card-title">Mise a jour firmware (OTA)</div>
+    <div class="info-row">
+      <span class="label">Version</span>
+      <span class="value" id="ver">...</span>
+    </div>
+    <div class="status-box" style="margin-top:14px;">
+      <div class="dot" id="dot"></div>
+      <span id="status-text">Chargement...</span>
+    </div>
+    <button class="btn" id="btn-update" onclick="lancerUpdate()">Verifier et mettre a jour</button>
+    <p class="note" id="note">L'ESP32 redemarrera automatiquement apres la mise a jour.</p>
+  </div>
+
 </div>
-
 <script>
   var polling = null;
 
+  // ── OTA ──
   function setDot(state) {
     var d = document.getElementById('dot');
     d.className = 'dot';
@@ -244,49 +348,71 @@ static const char HTML_PAGE[] PROGMEM = R"rawliteral(
     else if (state === 'ok')  d.classList.add('active');
     else if (state === 'err') d.classList.add('error');
   }
-
-  function updateUI() {
+  function updateOTA() {
     fetch('/status').then(function(r){ return r.text(); }).then(function(t){
       document.getElementById('status-text').textContent = t;
       var low = t.toLowerCase();
       if (low.indexOf('cours') !== -1 || low.indexOf('recherche') !== -1) {
-        setDot('working');
-        document.getElementById('btn-update').disabled = true;
+        setDot('working'); document.getElementById('btn-update').disabled = true;
       } else if (low.indexOf('terminee') !== -1) {
-        setDot('ok');
-        document.getElementById('note').textContent = 'Redemarrage en cours...';
-        stopPolling();
+        setDot('ok'); document.getElementById('note').textContent = 'Redemarrage en cours...'; stopPolling();
       } else if (low.indexOf('erreur') !== -1) {
-        setDot('err');
-        document.getElementById('btn-update').disabled = false;
-        stopPolling();
+        setDot('err'); document.getElementById('btn-update').disabled = false; stopPolling();
       } else {
-        setDot('');
-        document.getElementById('btn-update').disabled = false;
-        if (low.indexOf('disponible') !== -1) stopPolling();
+        setDot(''); document.getElementById('btn-update').disabled = false;
       }
     }).catch(function(){});
-
     fetch('/version').then(function(r){ return r.text(); }).then(function(t){
-      document.getElementById('ver').textContent = t;
+      document.getElementById('ver').textContent = 'v' + t;
     }).catch(function(){});
   }
-
-  function stopPolling() {
-    if (polling) { clearInterval(polling); polling = null; }
-  }
-
+  function stopPolling() { if (polling) { clearInterval(polling); polling = null; } }
   function lancerUpdate() {
     document.getElementById('btn-update').disabled = true;
     setDot('working');
     document.getElementById('status-text').textContent = 'Demarrage...';
     fetch('/update').catch(function(){});
-    polling = setInterval(updateUI, 2000);
+    polling = setInterval(updateOTA, 2000);
   }
 
-  // Affichage IP local
-  document.getElementById('ip').textContent = location.hostname;
+  // ── Pompe ──
+  function togglePump(cb) {
+    var val = cb.checked ? '1' : '0';
+    fetch('/pump', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'state=' + val
+    }).catch(function(){});
+  }
+  function updatePump() {
+    fetch('/pump').then(function(r){ return r.text(); }).then(function(t){
+      var on = (t.trim() === '1');
+      document.getElementById('pump-toggle').checked = on;
+    }).catch(function(){});
+    fetch('/pump-state').then(function(r){ return r.text(); }).then(function(t){
+      var on = (t.trim() === '1');
+      var dot = document.getElementById('ind-dot');
+      var txt = document.getElementById('ind-text');
+      dot.className = 'ind-dot ' + (on ? 'on' : 'off');
+      txt.textContent = on ? 'Pompe ON — en fonctionnement' : 'Pompe OFF — arretee';
+    }).catch(function(){});
+  }
 
+  // ── Programme ──
+  function updateProg() {
+    fetch('/programme').then(function(r){ return r.text(); }).then(function(t){
+      var box = document.getElementById('prog-box');
+      if (t && t.trim().length > 0 && t.trim() !== '--') {
+        box.className = 'prog-box';
+        box.textContent = t.trim();
+      } else {
+        box.className = 'prog-box empty';
+        box.textContent = 'Aucun programme configure';
+      }
+    }).catch(function(){});
+  }
+
+  // ── Alerte ──
   function checkAlert() {
     fetch('/alert').then(function(r){ return r.text(); }).then(function(t){
       var banner = document.getElementById('alert-banner');
@@ -299,10 +425,12 @@ static const char HTML_PAGE[] PROGMEM = R"rawliteral(
     }).catch(function(){});
   }
 
-  // Rafraichissement initial
-  updateUI();
-  checkAlert();
-  setInterval(updateUI, 8000);
+  // ── Init ──
+  document.getElementById('ip').textContent = location.hostname;
+  updateOTA(); updatePump(); updateProg(); checkAlert();
+  setInterval(updateOTA,  8000);
+  setInterval(updatePump, 3000);
+  setInterval(updateProg, 10000);
   setInterval(checkAlert, 5000);
 </script>
 </body>
@@ -469,6 +597,37 @@ void setupWebServer() {
   // Alerte système courante
   server.on("/alert", HTTP_GET, []() {
     server.send(200, "text/plain; charset=utf-8", systemAlert);
+  });
+
+  // Etat commande pompe (GET) + commande (POST)
+  server.on("/pump", HTTP_GET, []() {
+    server.send(200, "text/plain", pumpRunning ? "1" : "0");
+  });
+  server.on("/pump", HTTP_POST, []() {
+    if (server.hasArg("state")) {
+      String val = server.arg("state");
+      bool newState = (val == "1" || val == "on" || val == "ON");
+      setPump(newState);
+      server.send(200, "text/plain", "OK");
+    } else {
+      server.send(400, "text/plain", "Missing state");
+    }
+  });
+
+  // Etat reel de la pompe (retour physique)
+  server.on("/pump-state", HTTP_GET, []() {
+    server.send(200, "text/plain", pumpRunning ? "1" : "0");
+  });
+
+  // Prochain programme
+  server.on("/programme", HTTP_GET, []() {
+    if (hasProgram) {
+      String prog = String(nextWaterDate) + " a " + String(nextWaterTime);
+      if (strlen(nextWaterDur) > 0) prog += " — " + String(nextWaterDur);
+      server.send(200, "text/plain; charset=utf-8", prog);
+    } else {
+      server.send(200, "text/plain", "--");
+    }
   });
 
   // 404
