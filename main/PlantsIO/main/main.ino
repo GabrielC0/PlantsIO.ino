@@ -110,6 +110,9 @@ String   otaMessage   = "Inactif";
 bool     otaRequested = false;  // Flag déclenché par GET /update
 String   systemAlert  = "";    // Dernière alerte critique système
 
+bool     updateAvailable  = false;  // Mise à jour détectée au boot
+String   remoteVersionStr = "";     // Version distante disponible
+
 // ─────────────────────────────────────────
 //   Prototypes
 // ─────────────────────────────────────────
@@ -129,6 +132,8 @@ void     criticalError(String msg);
 void     setupWebServer();
 void     setOtaState(OtaState state, String detail = "");
 void     checkAndUpdate();
+void     checkUpdateAvailable();
+void     showUpdateAvailableAnim(const String& remoteVer);
 String   getRemoteVersion();
 bool     isNewerVersion(const String& remoteVer, const String& localVer);
 void     performOTA();
@@ -487,6 +492,9 @@ void setup() {
   } else {
     Serial.println("[mDNS] Echec demarrage mDNS");
   }
+
+  // ── Vérification mise à jour disponible au boot ──
+  checkUpdateAvailable();
 
   // ── Serveur web OTA ──
   setupWebServer();
@@ -873,6 +881,77 @@ void checkAndUpdate() {
   performOTA();
 }
 
+// Animation OLED quand une mise à jour est détectée au boot
+void showUpdateAvailableAnim(const String& remoteVer) {
+  // ── Phase 1 : slide-in depuis le bas (8 frames) ──
+  for (int y = 64; y >= 0; y -= 8) {
+    display.clearDisplay();
+    // Cadre arrondi simulé avec des rectangles
+    display.drawRect(0, y, 128, 64, SSD1306_WHITE);
+    display.fillRect(1, y + 1, 126, 62, SSD1306_BLACK);
+    // Barre de titre pleine
+    display.fillRect(1, y + 1, 126, 14, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+    display.setTextSize(1);
+    display.setCursor(22, y + 4);
+    display.print("MISE A JOUR DISPO");
+    // Icône flèche download dessinée en pixels (centre-haut)
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(8, y + 20);
+    display.print("Nouvelle version :");
+    display.setCursor(22, y + 32);
+    display.setTextSize(1);
+    display.print("v" FW_VERSION "  ->  v" + remoteVer);
+    display.setCursor(4, y + 46);
+    display.print("Mettre a jour : site web");
+    display.display();
+    delay(30);
+  }
+
+  // ── Phase 2 : icône download animée (3x) ──
+  String arrow[] = {" [      ] ", " [ >    ] ", " [ >>   ] ", " [ >>>  ] ", " [ >>>> ] " };
+  for (int rep = 0; rep < 3; rep++) {
+    for (int f = 0; f < 5; f++) {
+      display.fillRect(1, 30, 126, 12, SSD1306_BLACK);
+      display.setTextColor(SSD1306_WHITE);
+      display.setTextSize(1);
+      display.setCursor(18, 33);
+      display.print(arrow[f]);
+      display.display();
+      delay(120);
+    }
+  }
+
+  // ── Phase 3 : affichage stable 4 secondes ──
+  display.fillRect(1, 30, 126, 12, SSD1306_BLACK);
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(22, 33);
+  display.print("v" FW_VERSION "  ->  v" + remoteVer);
+  display.display();
+  delay(4000);
+}
+
+// Vérifie la version GitHub au boot sans bloquer longtemps
+void checkUpdateAvailable() {
+  Serial.println("[OTA] Verification de mise a jour au demarrage...");
+  oledPrint("== Demarrage ==", "Verif MAJ...");
+  String remoteVer = getRemoteVersion();
+  if (remoteVer.length() == 0) {
+    Serial.println("[OTA] Impossible de joindre GitHub (version.txt)");
+    return;
+  }
+  Serial.printf("[OTA] Local: %s — Distant: %s\n", FW_VERSION, remoteVer.c_str());
+  if (isNewerVersion(remoteVer, FW_VERSION)) {
+    updateAvailable  = true;
+    remoteVersionStr = remoteVer;
+    Serial.printf("[OTA] Mise a jour disponible : v%s\n", remoteVer.c_str());
+    showUpdateAvailableAnim(remoteVer);
+  } else {
+    Serial.println("[OTA] Firmware a jour.");
+  }
+}
+
 
 // ════════════════════════════════════════════════════════════
 //                   FONCTIONS WIFI
@@ -1210,7 +1289,20 @@ void updateStatusScreen() {
   display.drawLine(0, 43, 127, 43, SSD1306_WHITE);
 
   display.setTextSize(1);
-  if (!hasProgram) {
+
+  // Si mise à jour disponible : alterner toutes les 3s entre le programme et le bandeau MAJ
+  bool showUpdateBanner = updateAvailable && otaState == OTA_IDLE && (millis() / 3000) % 2 == 1;
+
+  if (showUpdateBanner) {
+    // Bandeau pro : fond blanc inversé
+    display.fillRect(0, 44, 128, 20, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+    display.setCursor(2, 46);
+    display.print("  MAJ  v" FW_VERSION "->v" + remoteVersionStr);
+    display.setCursor(14, 56);
+    display.print("Mettre a jour : web");
+    display.setTextColor(SSD1306_WHITE);
+  } else if (!hasProgram) {
     display.setCursor(19, 52);
     display.print("Aucun programme");
   } else {
