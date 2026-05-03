@@ -5,6 +5,7 @@
 
 #include <WiFi.h>
 #include <WiFiManager.h>
+#include <ESPmDNS.h>
 #include <Wire.h>
 #include <time.h>
 #include <Adafruit_GFX.h>
@@ -480,12 +481,20 @@ void setup() {
     startConfigPortal();
   }
 
+  // ── mDNS (hostname fixe : plantsio-esp.local) ──
+  if (MDNS.begin("plantsio-esp")) {
+    Serial.println("[mDNS] Hostname : plantsio-esp.local");
+  } else {
+    Serial.println("[mDNS] Echec demarrage mDNS");
+  }
+
   // ── Serveur web OTA ──
   setupWebServer();
   server.begin();
   Serial.println("[WEB] Serveur HTTP demarre sur port 80");
   Serial.print("[WEB] Adresse : http://");
   Serial.println(WiFi.localIP());
+  Serial.println("[WEB] Adresse mDNS : http://plantsio-esp.local");
 
   // ── MQTT ──
   mqtt.subscribe(&pumpFeed);
