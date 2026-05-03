@@ -945,7 +945,8 @@ void connectAdafruitIO() {
       return;
     }
 
-    const char* errMsg = mqtt.connectErrorString(ret);
+    String errStr = String(mqtt.connectErrorString(ret));
+    const char* errMsg = errStr.c_str();
     Serial.printf("[AIO] Echec tentative %d/%d (code=%d) : %s\n",
                   attempt, AIO_MAX_RETRIES, ret, errMsg);
 
