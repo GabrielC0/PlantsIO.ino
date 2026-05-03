@@ -55,8 +55,8 @@
 #define FW_VERSION        "1.0.0"
 
 // URLs RAW GitHub (format : raw.githubusercontent.com/USER/REPO/BRANCHE/fichier)
-#define OTA_VERSION_URL   "https://raw.githubusercontent.com/GabrielC0/PlantsIO.ino/main/version.txt"
-#define OTA_FIRMWARE_URL  "https://raw.githubusercontent.com/GabrielC0/PlantsIO.ino/main/firmware.bin"
+#define OTA_VERSION_URL   "https://raw.githubusercontent.com/GabrielC0/PlantsIO.ino/main/main/PlantsIO/main/version.txt"
+#define OTA_FIRMWARE_URL  "https://raw.githubusercontent.com/GabrielC0/PlantsIO.ino/main/main/PlantsIO/main/firmware.bin"
 
 // Timeout téléchargement (ms)
 #define OTA_TIMEOUT_MS    60000
