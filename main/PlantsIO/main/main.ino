@@ -42,6 +42,12 @@
 #define AP_SSID           "Arrosage-Setup"
 
 // ─────────────────────────────────────────
+//   Adafruit IO — reconnexion
+// ─────────────────────────────────────────
+#define AIO_MAX_RETRIES   5
+#define AIO_RETRY_DELAY_S 5
+
+// ─────────────────────────────────────────
 //   OTA — À CONFIGURER
 // ─────────────────────────────────────────
 // Version locale du firmware (format X.Y.Z)
@@ -61,8 +67,10 @@ Adafruit_SSD1306  display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 WiFiManager       wifiManager;
 WebServer         server(80);
 
+// Client ID unique basé sur le MAC de la puce (évite code=-2 / doublon de session)
+char _mqttClientId[40] = "plantsio_esp32";
 WiFiClient client;
-Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, IO_USERNAME, IO_USERNAME, IO_KEY);
+Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, _mqttClientId, IO_USERNAME, IO_KEY);
 
 Adafruit_MQTT_Subscribe pumpFeed     = Adafruit_MQTT_Subscribe(&mqtt, IO_USERNAME "/feeds/pompe");
 Adafruit_MQTT_Publish   pumpGet      = Adafruit_MQTT_Publish(&mqtt,   IO_USERNAME "/feeds/pompe/get");
@@ -123,6 +131,7 @@ void     checkAndUpdate();
 String   getRemoteVersion();
 bool     isNewerVersion(const String& remoteVer, const String& localVer);
 void     performOTA();
+void     showAioReconnecting(int attempt, int maxAttempts, int countdown, const char* errorMsg = nullptr);
 
 
 // ════════════════════════════════════════════════════════════
@@ -445,6 +454,10 @@ void setup() {
   delay(1500);
   Serial.begin(115200);
   Serial.println("\n\n=== Arrosage Automatique v" FW_VERSION " ===");
+
+  // ── ID MQTT unique (MAC ESP32) ──
+  snprintf(_mqttClientId, sizeof(_mqttClientId), "plantsio_%08X", (uint32_t)ESP.getEfuseMac());
+  Serial.printf("[MQTT] Client ID : %s\n", _mqttClientId);
 
   // ── GPIO ──
   pinMode(RELAY_PIN, OUTPUT);
@@ -910,36 +923,42 @@ void startConfigPortal() {
 // ════════════════════════════════════════════════════════════
 
 void connectAdafruitIO() {
-  Serial.printf("[AIO] Connexion Adafruit IO (MQTT) — serveur: %s:%d — user: %s\n",
-                AIO_SERVER, AIO_SERVERPORT, IO_USERNAME);
-  oledPrint("== Arrosage Auto ==", "WiFi: OK", "Connexion AIO...");
+  Serial.printf("[AIO] Connexion Adafruit IO (MQTT) — serveur: %s:%d — user: %s — clientId: %s\n",
+                AIO_SERVER, AIO_SERVERPORT, IO_USERNAME, _mqttClientId);
 
-  int8_t ret;
-  int retries = 5;
-  int attempt = 0;
-  while ((ret = mqtt.connect()) != 0) {
-    attempt++;
-    Serial.printf("[AIO] Echec tentative %d/5 (code=%d) : %s\n",
-                  attempt, ret, mqtt.connectErrorString(ret));
-    oledPrint("== AIO ERREUR ==", String(mqtt.connectErrorString(ret)), "Reessai dans 5s");
+  for (int attempt = 1; attempt <= AIO_MAX_RETRIES; attempt++) {
+    // Nettoyage propre avant chaque tentative
     mqtt.disconnect();
-    delay(5000);
-    retries--;
-    if (retries == 0) {
-      criticalError("Echec connexion AIO (5/5)");
+    delay(200);
+
+    Serial.printf("[AIO] Tentative %d/%d...\n", attempt, AIO_MAX_RETRIES);
+    oledPrint("== Connexion AIO ==", "Tentative " + String(attempt) + "/" + String(AIO_MAX_RETRIES), "Connexion...");
+
+    int8_t ret = mqtt.connect();
+    if (ret == 0) {
+      Serial.printf("[AIO] Connecte avec succes a la tentative %d !\n", attempt);
+      aioConnected = true;
+      if (WiFi.status() == WL_CONNECTED) syncTimeNow();
+      pumpGet.publish("\0");
+      programmeGet.publish("\0");
+      updateStatusScreen();
+      return;
+    }
+
+    const char* errMsg = mqtt.connectErrorString(ret);
+    Serial.printf("[AIO] Echec tentative %d/%d (code=%d) : %s\n",
+                  attempt, AIO_MAX_RETRIES, ret, errMsg);
+
+    if (attempt < AIO_MAX_RETRIES) {
+      // Décompte animé sur l'OLED
+      for (int c = AIO_RETRY_DELAY_S; c > 0; c--) {
+        showAioReconnecting(attempt, AIO_MAX_RETRIES, c, errMsg);
+        delay(1000);
+      }
     }
   }
 
-  Serial.printf("[AIO] Connecte avec succes apres %d tentative(s) !\n", attempt + 1);
-  aioConnected = true;
-
-  if (WiFi.status() == WL_CONNECTED) {
-    syncTimeNow();
-  }
-
-  pumpGet.publish("\0");
-  programmeGet.publish("\0");
-  updateStatusScreen();
+  criticalError("Echec connexion AIO (" + String(AIO_MAX_RETRIES) + "/" + String(AIO_MAX_RETRIES) + ")");
 }
 
 
@@ -1084,6 +1103,60 @@ void showWifiConfigPortal() {
   display.print("IP:   192.168.4.1");
   display.setCursor(0, 52);
   display.print("Ouvre ton navigateur");
+  display.display();
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Écran animé de reconnexion AIO
+//  Appelé 1x par seconde pendant le délai entre deux tentatives
+// ─────────────────────────────────────────────────────────────
+void showAioReconnecting(int attempt, int maxAttempts, int countdown, const char* errorMsg) {
+  static uint8_t dotStep = 0;
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  // ── Titre ──
+  display.setCursor(16, 0);
+  display.print("== Connexion AIO ==");
+  display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+  // ── Tentative X / N ──
+  display.setCursor(0, 13);
+  display.print("Tentative ");
+  display.print(attempt);
+  display.print(" / ");
+  display.print(maxAttempts);
+
+  // ── Message d'erreur court (tronqué à 21 chars) ──
+  if (errorMsg != nullptr) {
+    display.setCursor(0, 23);
+    char errBuf[22];
+    strncpy(errBuf, errorMsg, 21);
+    errBuf[21] = '\0';
+    display.print(errBuf);
+  }
+
+  // ── Décompte ──
+  display.setCursor(0, 34);
+  display.print("Reessai dans ");
+  display.print(countdown);
+  display.print("s");
+
+  // ── Barre de progression du décompte ──
+  // La barre se remplit au fur et à mesure que le délai s'écoule
+  int elapsed = AIO_RETRY_DELAY_S - countdown;
+  int barFill = (128 * elapsed) / AIO_RETRY_DELAY_S;
+  display.drawRect(0, 44, 128, 8, SSD1306_WHITE);
+  if (barFill > 0) display.fillRect(0, 44, barFill, 8, SSD1306_WHITE);
+
+  // ── Points animés ──
+  dotStep = (dotStep + 1) % 4;
+  display.setCursor(0, 55);
+  display.print("AIO");
+  for (uint8_t i = 0; i < dotStep; i++) display.print(".");
+
   display.display();
 }
 
