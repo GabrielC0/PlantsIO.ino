@@ -21,8 +21,7 @@
 // ─────────────────────────────────────────
 //   Adafruit IO
 // ─────────────────────────────────────────
-#define IO_USERNAME    ""
-#define IO_KEY         ""
+// IO_USERNAME et IO_KEY sont définis dans secrets.h
 
 #define AIO_SERVER      "io.adafruit.com"
 #define AIO_SERVERPORT  1883
