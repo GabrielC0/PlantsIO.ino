@@ -161,6 +161,9 @@
 #define AIO_MAX_RETRIES      5            // EF-306
 #define AIO_RETRY_DELAY_S    2
 #define AIO_PING_INTERVAL_MS 30000UL      // EF-308
+// Publication periodique de pompe_etat. Doit rester <= 90 s : au-dela le
+// serveur declare l'ESP32 hors ligne (ESP_STALE_MS dans adafruit.service.ts).
+#define AIO_STATE_BEAT_MS    30000UL
 
 // ─────────────────────────────────────────
 //   OTA (cf. §7.6)

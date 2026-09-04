@@ -144,6 +144,22 @@ void serviceMqtt() {
       DBG("MQTT ping OK");
     }
   }
+
+  // Heartbeat d'etat : le serveur ne deduit "ESP32 en ligne" que de l'age du
+  // dernier message recu sur pompe_etat, et le considere hors ligne au-dela de
+  // 90 s. Publier seulement sur transition ne suffit pas : entre deux arrosages
+  // l'appareil paraitrait mort. C'est aussi ce qui permet au serveur de
+  // detecter un arret de securite decide ici et d'abandonner sa session au lieu
+  // de republier "1" toutes les 30 s.
+  static unsigned long lastStateBeat = 0;
+  if (millis() - lastStateBeat >= AIO_STATE_BEAT_MS) {
+    lastStateBeat = millis();
+    if (!stateFeed.publish(pumpRunning ? "1" : "0")) {
+      wlog("[AIO] Heartbeat pompe_etat echoue");
+    } else {
+      DBG("Heartbeat pompe_etat = %d", (int)pumpRunning);
+    }
+  }
 }
 
 // ────────────────────────────────────────────────────────────
