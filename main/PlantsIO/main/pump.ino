@@ -36,6 +36,14 @@ void setPump(bool state, bool userCommand, bool fromCloud) {
     rtcPumpUsedMs  = 0;
   }
 
+  // Anti-crash tension : un flash OTA sature deja la radio et la flash.
+  // Ajouter l'appel de courant du relais et de la pompe par-dessus, c'est le
+  // brownout garanti - et un brownout pendant l'ecriture flash laisse une brique.
+  if (state && otaState == OTA_DOWNLOADING) {
+    wlog("[POMPE] ON refuse : mise a jour OTA en cours");
+    return;
+  }
+
   bool previous = pumpRunning;
 
   pumpRunning = state;
@@ -60,6 +68,12 @@ void setPump(bool state, bool userCommand, bool fromCloud) {
            progMs ? "duree programmee" : "plafond securite",
            (unsigned long)(rtcPumpUsedMs / 1000UL));
     }
+    // Anti-crash tension : toute commutation du relais - ON comme OFF - ouvre
+    // une fenetre de silence. C'est la simultaneite qui fait brownouter, pas le
+    // courant de la pompe seul : le relais s'enclenchait pile pendant un burst
+    // radio ou un handshake TLS. Cf. powerQuiet() plus bas.
+    powerQuietUntilMs = millis() + PUMP_SETTLE_MS;
+
     pumpChangeMs     = millis();
     pumpChangeActive = true;
     pumpChangeState  = state;
@@ -140,6 +154,119 @@ void servicePumpTimeout() {
     pumpCmd.publish("0");
     alertFeed.publish(systemAlert);
   }
+}
+
+// ────────────────────────────────────────────────────────────
+//  Anti-crash tension
+//
+//  Trois mecanismes, du plus general au plus specifique :
+//
+//   1. applyResetPolicy() - au boot, tire les consequences d'un brownout.
+//      Un brownout peut corrompre la RTC RAM sans etre une intervention
+//      humaine : repartir d'un budget anti-inondation neuf, avec la valeur
+//      retenue "1" du feed pompe relue au /get, donnait un arrosage permanent
+//      a chaque boucle de brownout. On suppose donc le budget consomme et on
+//      pose le verrou.
+//   2. powerQuiet() - fenetre de silence apres chaque commutation du relais.
+//      Purement logiciel, actif par defaut. Empeche le firmware d'empiler un
+//      handshake TLS, un flash OTA ou un rafraichissement I2C sur le
+//      transitoire d'enclenchement.
+//   3. serviceVinMonitor() - surveillance de VIN par l'ADC (OPTIONNELLE, elle
+//      demande un pont diviseur). Seule protection *preemptive* : elle coupe
+//      la pompe avant que le detecteur de brownout materiel de l'ESP32 ne
+//      coupe tout.
+//
+//  Le vrai correctif reste materiel : condensateur de decouplage 470-1000 uF
+//  sur le 3V3 et alimentation pompe separee. Le firmware ne peut supprimer que
+//  les pics qu'il s'infligeait lui-meme.
+// ────────────────────────────────────────────────────────────
+
+// Extraite de setup() pour etre testable (cf. selftest.ino) : c'est la logique
+// qui laissait passer un arrosage permanent en boucle de brownout.
+// Renvoie true si le redemarrage etait un brownout.
+bool applyResetPolicy(esp_reset_reason_t reason) {
+  bool wasBrownout = (reason == ESP_RST_BROWNOUT);
+
+  // Sur un power-on la RTC RAM contient du bruit, on la reset. Un brownout
+  // sevère peut produire le meme symptome sans intervention humaine : dans ce
+  // cas on ne remet a zero que ce qui va dans le sens de la securite.
+  if (rtcMagic != RTC_STATE_MAGIC) {
+    rtcMagic       = RTC_STATE_MAGIC;
+    rtcCritBoots   = 0;
+    rtcBrownouts   = 0;
+    rtcPumpLockout = 0;
+    // Budget suppose consomme apres un brownout, neuf sinon.
+    rtcPumpUsedMs  = wasBrownout ? PUMP_MAX_ON_MS : 0;
+  }
+
+  if (wasBrownout) {
+    // La pompe est le suspect numero 1 du creux de tension. Verrou pose sans
+    // condition : la valeur retenue "1" du feed ne peut plus la relancer, il
+    // faudra un OFF explicite puis un nouveau ON.
+    rtcPumpLockout = 1;
+    if (rtcBrownouts < 255) rtcBrownouts++;
+  } else if (reason == ESP_RST_POWERON) {
+    // Debranchement volontaire : l'incident d'alimentation est acquitte.
+    rtcBrownouts = 0;
+  }
+
+  return wasBrownout;
+}
+
+// true tant que la fenetre de silence post-commutation court.
+bool powerQuiet() {
+  if (powerQuietUntilMs == 0) return false;
+  // (long)(...) >= 0 : tolere le wraparound de millis() (~49 jours d'uptime)
+  if ((long)(millis() - powerQuietUntilMs) >= 0) {
+    powerQuietUntilMs = 0;
+    return false;
+  }
+  return true;
+}
+
+void serviceVinMonitor() {
+#if VIN_ADC_PIN >= 0
+  static unsigned long lastSample   = 0;
+  static uint8_t       vinLowStreak = 0;
+
+  if (millis() - lastSample < VIN_SAMPLE_PERIOD_MS) return;
+  lastSample = millis();
+
+  // analogReadMilliVolts() applique la courbe d'etalonnage gravee en eFuse ;
+  // VIN_ADC_CAL corrige la dispersion residuelle du pont diviseur.
+  uint32_t mv = analogReadMilliVolts(VIN_ADC_PIN);
+  lastVinMv = (int)(mv * VIN_DIVIDER_RATIO * VIN_ADC_CAL);
+
+  if (lastVinMv >= VIN_MIN_MV) {
+    vinLowStreak = 0;
+    return;
+  }
+
+  // Deux mesures de suite : un creux d'une seule periode est le transitoire
+  // normal d'enclenchement, pas une alimentation qui lache.
+  if (++vinLowStreak < 2) return;
+  vinLowStreak = 0;
+
+  if (!pumpRunning) {
+    wlog("[TENSION] VIN=%dmV sous le seuil %dmV (pompe deja arretee)",
+         lastVinMv, VIN_MIN_MV);
+    return;
+  }
+
+  wlog("[TENSION] VIN=%dmV < %dmV : coupure preventive de la pompe",
+       lastVinMv, VIN_MIN_MV);
+  setPump(false);          // OFF de securite : n'acquitte pas le verrou...
+  rtcPumpLockout = 1;      // ...que l'on pose ici, et qui survit au reboot
+
+  snprintf(systemAlert, sizeof(systemAlert),
+           "Tension basse (%d mV) : arrosage coupe", lastVinMv);
+
+  if (aioConnected) {
+    // Best-effort : la securite ne depend pas de la reussite de ces publications.
+    pumpCmd.publish("0");
+    alertFeed.publish(systemAlert);
+  }
+#endif
 }
 
 // ────────────────────────────────────────────────────────────

@@ -82,6 +82,63 @@ void runSelfTest() {
   stCheck(rtcPumpLockout == 0, "OFF explicite reacquitte le verrou");
   stCheck(rtcPumpUsedMs  == 0, "OFF explicite remet le budget a zero");
 
+  // ── Anti-crash tension : fenetre de silence post-commutation ──
+  // On ne peut pas la declencher par un vrai ON (le test ne demande jamais un
+  // ON qui serait accepte), on verifie donc le garde-fou lui-meme.
+  powerQuietUntilMs = millis() + 200;
+  stCheck(powerQuiet(),  "fenetre de silence active apres commutation");
+  { unsigned long u = millis() + 250;
+    while ((long)(millis() - u) < 0) { esp_task_wdt_reset(); delay(10); } }
+  stCheck(!powerQuiet(), "fenetre de silence expiree apres le delai");
+  stCheck(powerQuietUntilMs == 0, "fenetre expiree -> compteur rearme");
+
+  // Un ON refuse ne commute pas le relais : pas de fenetre a ouvrir.
+  rtcPumpLockout    = 1;
+  powerQuietUntilMs = 0;
+  setPump(true, true, true);
+  stCheck(!pumpRunning, "verrou actif : ON refuse (rappel)");
+  stCheck(powerQuietUntilMs == 0, "ON refuse -> aucune fenetre de silence");
+
+  // ── Anti-crash tension : politique de redemarrage ──
+  // C'est le bug qui donnait un arrosage permanent : brownout -> RTC RAM
+  // corrompue -> budget anti-inondation neuf -> la valeur retenue "1" du feed
+  // pompe relance l'arrosage -> brownout -> ...
+  uint8_t savedBrownouts = rtcBrownouts;
+
+  rtcMagic       = 0;              // simule une RTC RAM corrompue
+  rtcPumpUsedMs  = 0;
+  rtcPumpLockout = 0;
+  rtcBrownouts   = 0;
+  stCheck(applyResetPolicy(ESP_RST_BROWNOUT), "brownout reconnu");
+  stCheck(rtcPumpLockout == 1, "brownout -> verrou pose sans condition");
+  stCheck(rtcPumpUsedMs == PUMP_MAX_ON_MS,
+          "brownout + RTC corrompue -> budget suppose consomme");
+  stCheck(rtcBrownouts == 1, "brownout -> compteur incremente");
+
+  // Un brownout de plus, RTC RAM intacte cette fois : le budget est conserve.
+  rtcPumpUsedMs  = 1234;
+  rtcPumpLockout = 0;
+  applyResetPolicy(ESP_RST_BROWNOUT);
+  stCheck(rtcPumpUsedMs == 1234, "RTC intacte -> budget conserve tel quel");
+  stCheck(rtcBrownouts == 2, "2e brownout -> mode bas-conso au prochain boot");
+  stCheck(rtcBrownouts >= BROWNOUT_LOW_POWER_AT, "seuil bas-conso atteint");
+
+  // Debranchement volontaire : tout est acquitte.
+  rtcMagic       = 0;
+  rtcPumpUsedMs  = 1234;
+  rtcPumpLockout = 1;
+  applyResetPolicy(ESP_RST_POWERON);
+  stCheck(rtcPumpUsedMs  == 0, "power-on + RTC corrompue -> budget remis a zero");
+  stCheck(rtcPumpLockout == 0, "power-on -> verrou efface");
+  stCheck(rtcBrownouts   == 0, "power-on -> compteur de brownouts efface");
+
+  // Un reset logiciel ne doit pas toucher au compteur de brownouts.
+  rtcBrownouts = 2;
+  applyResetPolicy(ESP_RST_SW);
+  stCheck(rtcBrownouts == 2, "reset logiciel -> compteur de brownouts intact");
+
+  rtcBrownouts = savedBrownouts;
+
   // ── Restauration ──
   hasProgram     = savedHasProg;
   memcpy(nextWaterDur, savedDur, sizeof(nextWaterDur));

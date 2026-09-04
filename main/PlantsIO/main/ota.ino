@@ -110,6 +110,17 @@ void performOTA() {
   // OFF de sécurité (userCommand=false) : n'acquitte pas le verrou anti-inondation.
   setPump(false);
 
+  // Anti-crash tension : laisser retomber le transitoire de coupure avant
+  // d'ouvrir le TLS. Un brownout pendant l'écriture flash laisse une brique.
+  {
+    unsigned long settleUntil = millis() + PUMP_SETTLE_MS;
+    while ((long)(millis() - settleUntil) < 0) {
+      esp_task_wdt_reset();
+      delay(10);
+    }
+    powerQuietUntilMs = 0;   // fenêtre consommée, loop() n'a plus à attendre
+  }
+
   // SEC-02/SEC-07 : la chaîne du serveur est vérifiée avant de télécharger un
   // binaire qui va être flashé. Sans cette vérification, un MITM sur le réseau
   // servait son propre firmware et prenait le contrôle du relais.

@@ -111,6 +111,51 @@
 #define CRIT_BOOT_CLEAR_MS   300000UL
 
 // ─────────────────────────────────────────
+//   Anti-crash tension (brownout)
+// ─────────────────────────────────────────
+// Le firmware s'infligeait lui-meme des creux de tension : le relais
+// s'enclenchait pile pendant un burst radio, et l'ESP32 brownoutait a ~2.7 V.
+// Les reglages ci-dessous suppriment ces pics cumules.
+//
+// Puissance d'emission WiFi. Le core emet au maximum par defaut (+19.5 dBm),
+// soit des pics de ~300 mA sur le 3V3. A 13 dBm le pic tombe d'environ 40 %.
+// A CALIBRER : si le RSSI descend sous -75 dBm ou que les deconnexions se
+// multiplient, remonter (WIFI_POWER_15dBm, _17dBm, _19_5dBm).
+#define WIFI_TX_POWER            WIFI_POWER_13dBm
+// Plancher utilise en mode bas-conso (apres brownouts repetes).
+#define WIFI_TX_POWER_LOW        WIFI_POWER_5dBm
+
+// Fenetre de silence apres chaque commutation du relais : le temps que le
+// transitoire (bobine + appel de courant moteur) retombe, aucun autre gros
+// consommateur ne demarre (handshake TLS, OTA, rafraichissement I2C).
+// A CALIBRER : remonter jusqu'a ce que les brownouts cessent. 300 ms couvre
+// l'appel de courant d'une pompe 12 V typique.
+#define PUMP_SETTLE_MS           300UL
+
+// Brownouts consecutifs au-dela desquels on demarre en mode bas-conso.
+#define BROWNOUT_LOW_POWER_AT    2
+// Mode bas-conso : delai avant la 1re connexion MQTT. Le handshake TLS est le
+// plus gros pic du firmware, on laisse l'alimentation se stabiliser d'abord.
+#define LOW_POWER_MQTT_DELAY_MS  30000UL
+
+// Surveillance de VIN par l'ADC - OPTIONNELLE, demande un pont diviseur.
+// C'est la seule protection *preemptive* : couper la pompe avant que le
+// detecteur de brownout materiel de l'ESP32 ne coupe tout.
+// -1 = desactivee. Sinon : une broche ADC1 (32..39) reliee a VIN par le pont.
+#define VIN_ADC_PIN              -1
+// Rapport du pont : (R_haut + R_bas) / R_bas. Ex. 100k/22k -> 122/22 = 5.545
+#define VIN_DIVIDER_RATIO        5.545f
+// Correction de gain residuelle. L'ADC de l'ESP32 est non lineaire et disperse
+// d'une puce a l'autre : mesurer VIN au multimetre, lire la valeur annoncee
+// dans /state.json et ajuster jusqu'a concordance. Aucun calcul theorique ne
+// donne la bonne valeur.
+#define VIN_ADC_CAL              1.00f
+// Seuil de coupure, en mV sur VIN. Regler ~10 % au-dessus de la tension a
+// laquelle l'appareil brownoute reellement.
+#define VIN_MIN_MV               4600
+#define VIN_SAMPLE_PERIOD_MS     200UL
+
+// ─────────────────────────────────────────
 //   AIO / MQTT (cf. §7.3)
 // ─────────────────────────────────────────
 #define AIO_MAX_RETRIES      5            // EF-306
@@ -163,10 +208,22 @@ RTC_NOINIT_ATTR uint32_t rtcMagic;
 RTC_NOINIT_ATTR uint32_t rtcPumpUsedMs;    // ms de pompe ON cumules, tous reboots confondus
 RTC_NOINIT_ATTR uint8_t  rtcPumpLockout;   // 1 = tout ON refuse jusqu'a un OFF explicite
 RTC_NOINIT_ATTR uint8_t  rtcCritBoots;     // erreurs critiques consecutives
+RTC_NOINIT_ATTR uint8_t  rtcBrownouts;     // brownouts consecutifs (anti-crash tension)
 
 // Mode degrade : plus de MQTT ni d'OTA (les allocations TLS sont la premiere
 // cause de heap epuise), IHM web et commande locale de la pompe conservees.
 bool degradedMode = false;
+
+// Mode bas-conso : arme apres BROWNOUT_LOW_POWER_AT brownouts consecutifs.
+// TX WiFi au plancher, OTA refusee, 1re connexion MQTT differee.
+bool          lowPowerMode      = false;
+// Fin de la fenetre de silence ouverte par la derniere commutation du relais
+// (0 = pas de fenetre en cours). Cf. powerQuiet() dans pump.ino.
+unsigned long powerQuietUntilMs = 0;
+// Report de la 1re connexion MQTT en mode bas-conso (0 = pas de report).
+unsigned long mqttDeferUntilMs  = 0;
+// Derniere mesure de VIN en mV (0 si VIN_ADC_PIN est desactive).
+int           lastVinMv         = 0;
 
 // ─────────────────────────────────────────
 //   Objets globaux
@@ -262,6 +319,11 @@ void   secureClientInit(WiFiClientSecure& cli);
 //   n'est pas concerne : il garde le plafond generique PUMP_MAX_ON_MS.
 void   setPump(bool state, bool userCommand = false, bool fromCloud = false);
 void   servicePumpTimeout();
+// Anti-crash tension : politique appliquee a l'etat persistant selon la cause
+// du redemarrage, fenetre de silence post-commutation, surveillance de VIN.
+bool   applyResetPolicy(esp_reset_reason_t reason);
+bool   powerQuiet();
+void   serviceVinMonitor();
 void   criticalError(const char* msg);
 unsigned long programmeDurationMs();
 // S2 — wifi
@@ -315,13 +377,12 @@ void setup() {
   }
   esp_task_wdt_add(NULL);
 
-  // Etat persistant : sur un power-on la RTC RAM contient du bruit, on la reset.
-  if (rtcMagic != RTC_STATE_MAGIC) {
-    rtcMagic       = RTC_STATE_MAGIC;
-    rtcPumpUsedMs  = 0;
-    rtcPumpLockout = 0;
-    rtcCritBoots   = 0;
-  }
+  // Cause du redemarrage, lue avant tout : elle conditionne la restauration de
+  // l'etat persistant (cf. applyResetPolicy dans pump.ino).
+  esp_reset_reason_t resetReason = esp_reset_reason();
+  bool wasBrownout = applyResetPolicy(resetReason);
+
+  lowPowerMode = (rtcBrownouts >= BROWNOUT_LOW_POWER_AT);
   degradedMode = (rtcCritBoots >= CRIT_BOOT_LIMIT);
 
   unsigned long bootStartMs = millis();
@@ -339,7 +400,7 @@ void setup() {
 
   // EF-903 : tracer la cause du dernier redémarrage
   {
-    esp_reset_reason_t r = esp_reset_reason();
+    esp_reset_reason_t r = resetReason;
     const char* label;
     switch (r) {
       case ESP_RST_POWERON:   label = "Alimentation"; break;
@@ -371,6 +432,22 @@ void setup() {
     snprintf(systemAlert, sizeof(systemAlert),
              "Verrou securite actif : arrosage bloque jusqu'a un ordre OFF");
     wlog("[BOOT] %s", systemAlert);
+  }
+
+  if (wasBrownout) {
+    // Anti-crash tension : la pompe est le suspect numero 1 du creux. Le verrou
+    // est pose sans condition par applyResetPolicy, la valeur retenue "1" du
+    // feed pompe ne peut donc pas relancer l'arrosage au /get de la reconnexion.
+    snprintf(systemAlert, sizeof(systemAlert),
+             "Brownout n%d : arrosage bloque, verifier l'alimentation",
+             (int)rtcBrownouts);
+    wlog("[BOOT] %s", systemAlert);
+  }
+
+  if (lowPowerMode) {
+    wlog("[BOOT] Mode bas-conso : %d brownouts, TX WiFi au plancher, "
+         "OTA desactivee, MQTT differe de %lus",
+         (int)rtcBrownouts, LOW_POWER_MQTT_DELAY_MS / 1000UL);
   }
 
   if (degradedMode) {
@@ -429,6 +506,10 @@ void setup() {
   // ── Étape 2 : Vérification MAJ (S6) ──
   if (degradedMode) {
     setBootStep(2, STEP_WARN, "Mode degrade");
+  } else if (wasBrownout || lowPowerMode) {
+    // La verification MAJ est un handshake TLS : inutile de rajouter ce pic
+    // pendant qu'on doute encore de l'alimentation.
+    setBootStep(2, STEP_WARN, wasBrownout ? "Brownout: sautee" : "Bas-conso: sautee");
   } else {
     setBootStep(2, STEP_RUNNING, "GitHub...");
     checkUpdateAvailable();   // alimente bootSteps[2] et updateAvailable
@@ -443,6 +524,13 @@ void setup() {
   // ── Étape 3 : AIO/MQTT (S3) ──
   if (degradedMode) {
     setBootStep(3, STEP_WARN, "Mode degrade");
+  } else if (lowPowerMode) {
+    // Le handshake TLS est le plus gros pic du firmware. serviceMqtt() s'en
+    // chargera depuis loop() une fois l'alimentation stabilisee.
+    mqtt.subscribe(&pumpFeed);
+    mqtt.subscribe(&programmeFeed);
+    mqttDeferUntilMs = millis() + LOW_POWER_MQTT_DELAY_MS;
+    setBootStep(3, STEP_WARN, "Differe (bas-conso)");
   } else {
     setBootStep(3, STEP_RUNNING, "io.adafruit.com");
     mqtt.subscribe(&pumpFeed);
@@ -516,6 +604,9 @@ void loop() {
          (int)otaState,
          (int)rtcPumpLockout,
          degradedMode ? 1 : 0);
+    wlog("[STAT] tension: brownouts=%d bas_conso=%d vin=%dmV txpower=%d",
+         (int)rtcBrownouts, lowPowerMode ? 1 : 0, lastVinMv,
+         (int)WiFi.getTxPower());
 
     // Uptime sain : l'incident qui avait declenche les erreurs critiques est
     // derriere nous, on rearme le compteur (sans quoi 3 incidents espaces de
@@ -540,16 +631,28 @@ void loop() {
   // S8 — non bloquant pour la pompe et l'OLED (EF-808)
   server.handleClient();
 
+  // Anti-crash tension - surveillance preemptive de VIN (no-op si desactivee).
+  // Avant l'anti-inondation : une alim qui lache est plus urgente qu'un budget.
+  serviceVinMonitor();
+
   // S1 — securite anti-inondation. Placee avant tout "return" du loop pour
   // rester active meme sans WiFi / sans MQTT (EF-103 : source interne).
   servicePumpTimeout();
 
+  // Anti-crash tension - dans la fenetre qui suit une commutation du relais, on
+  // ne demarre aucun autre gros consommateur. Tout ce qui protege (WDT,
+  // anti-inondation, VIN) est deja servi au-dessus ; l'IHM web l'est aussi.
+  if (powerQuiet()) return;
+
   // S6 — MAJ déclenchée explicitement par /update (EF-604)
   if (otaRequested) {
     otaRequested = false;
-    if (degradedMode) {
-      // Un flash OTA a besoin de heap pour TLS : c'est exactement ce qui manque.
-      wlog("[OTA] Refusee : mode degrade");
+    if (degradedMode || lowPowerMode) {
+      // Mode degrade : un flash OTA a besoin de heap pour TLS, c'est exactement
+      // ce qui manque. Mode bas-conso : un brownout pendant l'ecriture flash
+      // laisse une brique - on ne flashe pas sur une alimentation douteuse.
+      wlog("[OTA] Refusee : %s",
+           degradedMode ? "mode degrade" : "mode bas-conso (brownouts)");
     } else {
       // OFF de securite : n'acquitte pas le verrou anti-inondation.
       setPump(false);          // EF-610 : pompe OFF avant download

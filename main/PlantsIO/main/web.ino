@@ -274,6 +274,7 @@ void setupWebServer() {
       "\"ota\":{\"msg\":\"%s\"},"
       "\"programme\":\"%s\",\"fw\":\"" FW_VERSION "\","
       "\"degraded\":%s,\"lock\":%s,"
+      "\"lowpower\":%s,\"brownouts\":%d,\"vin\":%d,"
       "\"update\":{\"available\":%s,\"remote\":\"%s\"}}",
       pumpRunning ? 1 : 0,
       safeAlert,
@@ -281,6 +282,9 @@ void setupWebServer() {
       safeProg,
       degradedMode   ? "true" : "false",
       rtcPumpLockout ? "true" : "false",
+      lowPowerMode   ? "true" : "false",
+      (int)rtcBrownouts,
+      lastVinMv,
       updateAvailable ? "true" : "false",
       remoteVersionStr);
 
@@ -292,10 +296,14 @@ void setupWebServer() {
         "{\"pump\":%d,\"alert\":\"Etat trop long\",\"ota\":{\"msg\":\"\"},"
         "\"programme\":\"\",\"fw\":\"" FW_VERSION "\","
         "\"degraded\":%s,\"lock\":%s,"
+        "\"lowpower\":%s,\"brownouts\":%d,\"vin\":%d,"
         "\"update\":{\"available\":false,\"remote\":\"\"}}",
         pumpRunning ? 1 : 0,
         degradedMode   ? "true" : "false",
-        rtcPumpLockout ? "true" : "false");
+        rtcPumpLockout ? "true" : "false",
+        lowPowerMode   ? "true" : "false",
+        (int)rtcBrownouts,
+        lastVinMv);
     }
 
     server.send(200, "application/json", buf);

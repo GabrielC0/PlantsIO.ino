@@ -41,6 +41,17 @@ static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 bool connectWifi() {
   WiFi.onEvent(onWifiEvent);
   WiFi.mode(WIFI_STA);
+
+  // Anti-crash tension : le core emet a la puissance maximale par defaut
+  // (+19.5 dBm), soit des pics de ~300 mA sur le 3V3 qui, cumules a
+  // l'enclenchement du relais, faisaient brownouter l'ESP32.
+  WiFi.setTxPower(lowPowerMode ? WIFI_TX_POWER_LOW : WIFI_TX_POWER);
+  // Modem sleep : le radio s'endort entre deux beacons, la conso moyenne chute.
+  // MIN_MODEM respecte le DTIM, l'IHM web et mDNS restent reactifs.
+  WiFi.setSleep(WIFI_PS_MIN_MODEM);
+  wlog("[WiFi] TX=%d (unites de 0.25 dBm)%s, modem sleep actif",
+       (int)WiFi.getTxPower(), lowPowerMode ? " [bas-conso]" : "");
+
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
   WiFi.setHostname(HOSTNAME_MDNS);

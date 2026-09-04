@@ -67,6 +67,15 @@ void serviceMqtt() {
     static unsigned long nextAttempt = 0;
     static unsigned long backoffMs   = 5000;
 
+    // Anti-crash tension : en mode bas-conso la 1re connexion est differee.
+    // Le handshake TLS est le plus gros pic du firmware, on laisse
+    // l'alimentation se stabiliser avant de le declencher.
+    if (mqttDeferUntilMs) {
+      if ((long)(millis() - mqttDeferUntilMs) < 0) return;
+      mqttDeferUntilMs = 0;
+      wlog("[AIO] Delai bas-conso ecoule, connexion");
+    }
+
     if (aioConnected) {
       aioConnected = false;
       wlog("[AIO] Lien tombe, reconnect en arriere-plan");
